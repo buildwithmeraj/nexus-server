@@ -9,7 +9,10 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const app = express();
 const port = process.env.PORT || 3000;
 var serviceAccount = require("./nexus-ed400-firebase-adminsdk-fbsvc-4cd65fc7ce.json");
-const uri = process.env.mongodb_uri;
+const uri = process.env.MONGODB_URI;
+
+// Database variables
+let categoriesDB, codesDB, categoriesCollection, codesCollection;
 
 // middleware
 app.use(
@@ -53,23 +56,57 @@ const client = new MongoClient(uri, {
   serverSelectionTimeoutMS: 10000,
 });
 
+let usersDB;
+let rolesCollection;
+
 // Connection function
 async function connectDB() {
-  if (!categoriesDB) {
+  if (!usersDB) {
     await client.connect();
-    categoriesDB = client.db("categoriesDB");
-    codesDB = client.db("categoriesDB");
-    categoriesCollection = categoriesDB.collection("categories");
-    codesCollection = codesDB.collection("codes");
+    usersDB = client.db("usersDB");
+    rolesCollection = usersDB.collection("rolesCollection");
     console.log("Connected to MongoDB!");
   }
-  return { categoriesCollection, codesCollection };
+  return { usersDB, rolesCollection };
 }
 
 // routes
 app.get("/", (req, res) => {
   res.send("Hello from backend!");
 });
+
+// roles management
+// get user roles
+app.get("/users/roles", async (req, res) => {
+  try {
+    const { rolesCollection } = await connectDB();
+    const cursor = rolesCollection.find();
+    const result = await cursor.toArray();
+    res.send(result);
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+
+// get a user's role
+app.get("/users/roles/:email", async (req, res) => {
+  try {
+    const { rolesCollection } = await connectDB();
+    const email = req.params.email;
+    const result = await rolesCollection.findOne({
+      email: email,
+    });
+    if (!result) {
+      return res.status(404).send({ message: "User role not found" });
+    }
+    res.send(result);
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+
 app.listen(port, () => {
   console.log(`Example app listening on port ${port}`);
 });
