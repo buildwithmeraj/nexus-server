@@ -15,6 +15,7 @@ const uri = process.env.MONGODB_URI;
 let categoriesDB, codesDB, categoriesCollection, codesCollection;
 
 // middleware
+app.use(express.json());
 app.use(
   cors({
     origin: "http://localhost:5173",
@@ -41,6 +42,21 @@ const verifyFireBaseToken = async (req, res, next) => {
     return res.status(401).send({ message: "unauthorized access" });
   }
 };
+// check admin middleware
+const verifyAdmin = async (req, res, next) => {
+  const token_email = req.token_email;
+  try {
+    const { usersCollection } = await connectDB();
+    const user = await usersCollection.findOne({ email: token_email });
+    if (user?.role !== "admin") {
+      return res.status(403).send({ message: "forbidden access" });
+    }
+    next();
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).send({ message: "Internal server error" });
+  }
+};
 
 // Create client outside with better options for serverless
 const client = new MongoClient(uri, {
@@ -57,17 +73,17 @@ const client = new MongoClient(uri, {
 });
 
 let usersDB;
-let rolesCollection;
+let usersCollection;
 
 // Connection function
 async function connectDB() {
   if (!usersDB) {
     await client.connect();
     usersDB = client.db("usersDB");
-    rolesCollection = usersDB.collection("rolesCollection");
+    usersCollection = usersDB.collection("usersCollection");
     console.log("Connected to MongoDB!");
   }
-  return { usersDB, rolesCollection };
+  return { usersDB, usersCollection };
 }
 
 // routes
@@ -76,25 +92,13 @@ app.get("/", (req, res) => {
 });
 
 // roles management
-// get user roles
-app.get("/users/roles", async (req, res) => {
-  try {
-    const { rolesCollection } = await connectDB();
-    const cursor = rolesCollection.find();
-    const result = await cursor.toArray();
-    res.send(result);
-  } catch (error) {
-    console.error("Error:", error);
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
 
 // get a user's role
-app.get("/users/roles/:email", async (req, res) => {
+app.get("/users/roles/:email", verifyFireBaseToken, async (req, res) => {
   try {
-    const { rolesCollection } = await connectDB();
+    const { usersCollection } = await connectDB();
     const email = req.params.email;
-    const result = await rolesCollection.findOne({
+    const result = await usersCollection.findOne({
       email: email,
     });
     if (!result) {
@@ -104,6 +108,42 @@ app.get("/users/roles/:email", async (req, res) => {
   } catch (error) {
     console.error("Error:", error);
     res.status(500).send({ message: "Internal server error" });
+  }
+});
+
+// add a user
+app.post("/users", async (req, res) => {
+  try {
+    const user = req.body;
+    const newUser = {
+      name: user.name,
+      email: user.email,
+      role: "member",
+      createdAt: user.createdAt || new Date(),
+    };
+    const { usersCollection } = await connectDB();
+    const existingUser = await usersCollection.findOne({ email: user.email });
+    if (existingUser) {
+      return res.status(409).send({ message: "User already exists" });
+    }
+    const result = await usersCollection.insertOne(newUser);
+    res.send(result);
+  } catch (error) {
+    console.error("Error:", error);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+
+// list all users for admin
+app.get("/users", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+  try {
+    const { usersCollection } = await connectDB();
+    const users = await usersCollection.find({}).toArray();
+    res.json(users);
+  } catch (error) {
+    res
+      .status(500)
+      .json({ message: "Error fetching categories", error: error.message });
   }
 });
 
