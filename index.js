@@ -94,7 +94,7 @@ app.get("/", (req, res) => {
 // roles management
 
 // get a user's role
-app.get("/users/roles/:email", verifyFireBaseToken, async (req, res) => {
+app.get("/users/role/:email", verifyFireBaseToken, async (req, res) => {
   try {
     const { usersCollection } = await connectDB();
     const email = req.params.email;
@@ -111,23 +111,73 @@ app.get("/users/roles/:email", verifyFireBaseToken, async (req, res) => {
   }
 });
 
+// update a user's role
+app.patch(
+  "/users/role/:id",
+  verifyFireBaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { usersCollection } = await connectDB();
+      const id = req.params.id;
+      const { type } = req.body;
+      const filter = { _id: new ObjectId(id) };
+      const currentRole = await usersCollection.findOne(filter);
+      if (!currentRole) {
+        return res.status(404).send({ message: "User not found" });
+      }
+      if (type === "promote") {
+        if (currentRole.role === "member") {
+          const updateRole = {
+            $set: { role: "clubManager" },
+          };
+          const result = await usersCollection.updateOne(filter, updateRole);
+          res.send({ message: "User promoted to clubManager", result });
+        } else if (currentRole.role === "clubManager") {
+          const updateRole = {
+            $set: { role: "admin" },
+          };
+          const result = await usersCollection.updateOne(filter, updateRole);
+          res.send({ message: "User promoted to Admin", result });
+        }
+      }
+      if (type === "demote") {
+        if (currentRole.role === "clubManager") {
+          const updateRole = {
+            $set: { role: "member" },
+          };
+          const result = await usersCollection.updateOne(filter, updateRole);
+          res.send({ message: "User demoted to member", result });
+        }
+      }
+    } catch (error) {
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+
 // add a user
 app.post("/users", async (req, res) => {
   try {
-    const user = req.body;
-    const newUser = {
-      name: user.name,
-      email: user.email,
-      role: "member",
-      createdAt: user.createdAt || new Date(),
-    };
+    const { name, email, photoURL, createdAt } = req.body;
+
     const { usersCollection } = await connectDB();
-    const existingUser = await usersCollection.findOne({ email: user.email });
+    const existingUser = await usersCollection.findOne({ email: email });
     if (existingUser) {
       return res.status(409).send({ message: "User already exists" });
     }
+    const newUser = {
+      name,
+      email,
+      photoURL,
+      role: "member",
+      createdAt: createdAt || new Date(),
+    };
     const result = await usersCollection.insertOne(newUser);
-    res.send(result);
+    res.status(201).json({
+      message: "User created successfully",
+      userId: result.insertedId,
+    });
   } catch (error) {
     console.error("Error:", error);
     res.status(500).send({ message: "Internal server error" });
