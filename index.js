@@ -11,9 +11,6 @@ const port = process.env.PORT || 3000;
 var serviceAccount = require("./nexus-ed400-firebase-adminsdk-fbsvc-4cd65fc7ce.json");
 const uri = process.env.MONGODB_URI;
 
-// Database variables
-let categoriesDB, codesDB, categoriesCollection, codesCollection;
-
 // middleware
 app.use(express.json());
 app.use(
@@ -74,13 +71,15 @@ const client = new MongoClient(uri, {
 
 let usersDB;
 let usersCollection;
+let applicationsCollection;
 
 // Connection function
 async function connectDB() {
-  if (!usersDB) {
+  if (!usersDB || !applicationsCollection) {
     await client.connect();
     usersDB = client.db("usersDB");
     usersCollection = usersDB.collection("usersCollection");
+    applicationsCollection = usersDB.collection("applicationsCollection");
     console.log("Connected to MongoDB!");
   }
   return { usersDB, usersCollection };
@@ -94,7 +93,7 @@ app.get("/", (req, res) => {
 // roles management
 
 // get a user's role
-app.get("/users/role/:email", verifyFireBaseToken, async (req, res) => {
+app.get("/users/role/:email", async (req, res) => {
   try {
     const { usersCollection } = await connectDB();
     const email = req.params.email;
@@ -156,6 +155,94 @@ app.patch(
   }
 );
 
+// club manager application
+app.post("/users/apply-club-manager", verifyFireBaseToken, async (req, res) => {
+  try {
+    const { usersCollection } = await connectDB();
+    const email = req.token_email;
+    const filter = { email: email };
+    const currentRole = await usersCollection.findOne(filter);
+    if (!currentRole) {
+      return res.status(404).send({ message: "User not found" });
+    }
+    if (currentRole.role !== "member") {
+      res
+        .status(400)
+        .send({ message: "Only Members can apply for Club Manager" });
+    }
+    const check = { email: email };
+    const checkApplication = await applicationsCollection.findOne(check);
+    if (checkApplication) {
+      return res
+        .status(400)
+        .send({ message: "Alrady applied for Club Manager" });
+    }
+    const newApplication = {
+      name: currentRole.name,
+      email: email,
+      status: "pending",
+      createdAt: new Date(),
+    };
+    const result = await applicationsCollection.insertOne(newApplication);
+    res.status(201).json({
+      message: "Application created successfully",
+      userId: result.insertedId,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+
+// club manager applications
+app.get(
+  "/admin/club-manager-applications/",
+  verifyFireBaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const applications = await applicationsCollection
+        .find(/*{ status: "pending" }*/)
+        .toArray();
+      if (!applications) {
+        return res.status(200).send({
+          message: "No application found for this user",
+          found: false,
+        });
+      }
+      res.json(applications);
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+
+// club manager application status
+app.get(
+  "/users/apply-club-manager/status",
+  verifyFireBaseToken,
+  async (req, res) => {
+    try {
+      const email = req.token_email;
+      const check = { email: email };
+      const checkApplication = await applicationsCollection.findOne(check);
+      if (!checkApplication) {
+        return res.status(200).send({
+          message: "No application found for this user",
+          found: false,
+        });
+      }
+      res.status(201).json({
+        message: "Application found",
+        application: checkApplication,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
 // add a user
 app.post("/users", async (req, res) => {
   try {
