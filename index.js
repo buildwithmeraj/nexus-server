@@ -38,8 +38,12 @@ const client = new MongoClient(uri, {
   connectTimeoutMS: 10000,
 });
 
-let usersDB, clubsDB, usersCollection, applicationsCollection, clubsCollection;
-
+let usersDB,
+  clubsDB,
+  usersCollection,
+  applicationsCollection,
+  clubsCollection,
+  membershipsCollection;
 async function connectDB() {
   if (!usersDB || !clubsDB) {
     await client.connect();
@@ -48,10 +52,17 @@ async function connectDB() {
     usersCollection = usersDB.collection("usersCollection");
     applicationsCollection = usersDB.collection("applicationsCollection");
     clubsCollection = clubsDB.collection("clubsCollection");
+    membershipsCollection = clubsDB.collection("membershipsCollection");
+
     console.log("Connected to MongoDB");
   }
 
-  return { usersCollection, applicationsCollection, clubsCollection };
+  return {
+    usersCollection,
+    applicationsCollection,
+    clubsCollection,
+    membershipsCollection,
+  };
 }
 
 // -------------------------------
@@ -253,7 +264,8 @@ app.get(
   verifyClubManager,
   async (req, res) => {
     try {
-      const { clubsCollection } = await connectDB();
+      //const { clubsCollection } = await connectDB();
+      const { applicationsCollection } = await connectDB();
       const apps = await applicationsCollection.find({}).toArray();
 
       res.send(apps);
@@ -367,24 +379,142 @@ app.get("/users", verifyFireBaseToken, verifyAdmin, async (req, res) => {
 });
 
 // -------------------------------
-// CLUBS LIST FOR MANAGERS
+// FETCH A CLUB
+// -------------------------------
+app.get("/clubs/details/:param", async (req, res) => {
+  try {
+    const param = req.params.param;
+    const { clubsCollection } = await connectDB();
+
+    const isObjectId = ObjectId.isValid(param);
+
+    if (isObjectId) {
+      const club = await clubsCollection.findOne({
+        _id: new ObjectId(param),
+      });
+
+      if (!club) {
+        return res.status(404).send({ message: "Club not found" });
+      }
+
+      return res.send(club);
+    }
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+
+// -------------------------------
+// FETCH A CLUB FOR ADMIN
 // -------------------------------
 app.get(
-  "/clubs/:email",
+  "/clubs/:param",
   verifyFireBaseToken,
   verifyClubManager,
   async (req, res) => {
     try {
-      const { clubsCollection } = await connectDB();
-      const email = req.params.email;
-      if (email !== req.token_email)
+      const param = req.params.param;
+      const { clubsCollection, usersCollection } = await connectDB();
+
+      const isObjectId = ObjectId.isValid(param);
+
+      if (isObjectId) {
+        const club = await clubsCollection.findOne({
+          _id: new ObjectId(param),
+        });
+
+        if (!club) {
+          return res.status(404).send({ message: "Club not found" });
+        }
+
+        if (club.managerEmail !== req.token_email) {
+          const user = await usersCollection.findOne({
+            email: req.token_email,
+          });
+
+          if (user?.role !== "admin") {
+            return res.status(403).send({
+              message: "You are not authorized to access this club",
+            });
+          }
+        }
+
+        return res.send(club);
+      }
+      const email = param;
+
+      if (email !== req.token_email) {
         return res.status(403).send({
           message: "You are not authorized to view clubs of other managers",
         });
-      const filter = { managerEmail: email };
-      const clubs = await clubsCollection.find(filter).toArray();
-      res.send(clubs);
-    } catch (e) {
+      }
+
+      const clubs = await clubsCollection
+        .find({ managerEmail: email })
+        .toArray();
+
+      return res.send(clubs);
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+
+// -------------------------------
+// CHECK MEMBERSHIP STATUS
+// -------------------------------
+app.get(
+  "/clubs/:clubId/membership-status",
+  verifyFireBaseToken,
+  async (req, res) => {
+    try {
+      const { clubId } = req.params;
+      const email = req.token_email;
+
+      const { membershipsCollection } = await connectDB();
+
+      if (!ObjectId.isValid(clubId)) {
+        return res.status(400).send({ message: "Invalid club ID" });
+      }
+
+      // Find membership record
+      const membership = await membershipsCollection.findOne({
+        userEmail: email,
+        clubId: new ObjectId(clubId),
+      });
+
+      // No membership found
+      if (!membership) {
+        return res.send({
+          isMember: false,
+          status: "none",
+        });
+      }
+
+      // Auto-expire expired memberships
+      if (
+        membership.expiresAt &&
+        new Date(membership.expiresAt).getTime() < Date.now()
+      ) {
+        await membershipsCollection.updateOne(
+          { _id: membership._id },
+          { $set: { status: "expired" } }
+        );
+
+        membership.status = "expired";
+      }
+
+      return res.send({
+        isMember: membership.status === "active",
+        status: membership.status,
+        paymentId: membership.paymentId || null,
+        joinedAt: membership.joinedAt,
+        expiresAt: membership.expiresAt,
+      });
+    } catch (err) {
+      console.error(err);
       res.status(500).send({ message: "Internal server error" });
     }
   }
@@ -441,6 +571,71 @@ app.post("/clubs", verifyFireBaseToken, verifyClubManager, async (req, res) => {
 });
 
 // -------------------------------
+// UPDATE CLUB DETAILS (MANAGER / ADMIN)
+// -------------------------------
+app.patch(
+  "/clubs/:id",
+  verifyFireBaseToken,
+  verifyClubManager,
+  async (req, res) => {
+    try {
+      const { clubsCollection, usersCollection } = await connectDB();
+      const id = req.params.id;
+
+      const existingClub = await clubsCollection.findOne({
+        _id: new ObjectId(id),
+      });
+
+      if (!existingClub) {
+        return res.status(404).send({ message: "Club not found" });
+      }
+
+      // Only owner or admin can edit
+      const user = await usersCollection.findOne({
+        email: req.token_email,
+      });
+
+      if (
+        existingClub.managerEmail !== req.token_email &&
+        user?.role !== "admin"
+      ) {
+        return res
+          .status(403)
+          .send({ message: "Not authorized to update this club" });
+      }
+
+      const {
+        clubName,
+        description,
+        category,
+        location,
+        membershipFee,
+        bannerImage,
+      } = req.body;
+
+      const updateDoc = {
+        $set: {
+          clubName,
+          description,
+          category,
+          location,
+          membershipFee: Number(membershipFee),
+          bannerImage,
+          updatedAt: new Date(),
+        },
+      };
+
+      await clubsCollection.updateOne({ _id: new ObjectId(id) }, updateDoc);
+
+      res.send({ message: "Club updated successfully" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+
+// -------------------------------
 // DELETE A CLUB
 // -------------------------------
 app.delete(
@@ -449,7 +644,7 @@ app.delete(
   verifyClubManager,
   async (req, res) => {
     try {
-      const { clubsCollection } = await connectDB();
+      const { clubsCollection, usersCollection } = await connectDB();
       const id = req.params.id;
 
       const club = await clubsCollection.findOne({
@@ -460,8 +655,10 @@ app.delete(
         return res.status(404).send({ message: "Club not found" });
       }
 
-      // Only the owner (or admin) can delete the club
-      if (club.managerEmail !== req.token_email) {
+      // Get user role from database
+      const user = await usersCollection.findOne({ email: req.token_email });
+
+      if (club.managerEmail !== req.token_email && user?.role !== "admin") {
         return res
           .status(403)
           .send({ message: "Not authorized to delete this club" });
@@ -470,6 +667,49 @@ app.delete(
       await clubsCollection.deleteOne({ _id: new ObjectId(id) });
 
       res.send({ message: "Club deleted successfully" });
+    } catch (e) {
+      console.error(e);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+
+// -------------------------------
+// LIST ALL CLUBS FOR ADMIN
+// -------------------------------
+app.get("/clubs", async (req, res) => {
+  try {
+    const { clubsCollection } = await connectDB();
+    const clubs = await clubsCollection.find().toArray();
+    res.send(clubs);
+  } catch {
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+
+// -------------------------------
+// CLUBS APPROVAL FOR ADMIN
+// -------------------------------
+app.patch(
+  "/clubs/status/:id",
+  verifyFireBaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { clubsCollection } = await connectDB();
+      const id = req.params.id;
+      const { status } = req.body;
+
+      if (!["pending", "approved", "rejected"].includes(status)) {
+        return res.status(400).send({ message: "Invalid status" });
+      }
+
+      const result = await clubsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status, updatedAt: new Date() } }
+      );
+
+      res.send({ message: `Club ${status}`, result });
     } catch (e) {
       console.error(e);
       res.status(500).send({ message: "Internal server error" });
