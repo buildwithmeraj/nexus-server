@@ -1,19 +1,22 @@
-// add requirements
+// Add requirements
 const express = require("express");
-var cors = require("cors");
+const cors = require("cors");
 require("dotenv").config();
 const admin = require("firebase-admin");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
 
-// define variables
+// Define variables
 const app = express();
 const port = process.env.PORT || 3000;
-const serviceAccount = require("./nexus-ed400-firebase-adminsdk-fbsvc-4cd65fc7ce.json");
+const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
+  "utf8"
+);
+const serviceAccount = JSON.parse(decoded);
 const uri = process.env.MONGODB_URI;
 const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
 
-// middleware
+// Middlewares
 app.use(express.json());
 app.use(
   cors({
@@ -22,14 +25,12 @@ app.use(
   })
 );
 
-// firebase admin setup
+// Firebase admin setup
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
 
-// -------------------------------
-// DATABASE SETUP
-// -------------------------------
+// MongoDB Setup
 const client = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -40,20 +41,20 @@ const client = new MongoClient(uri, {
   connectTimeoutMS: 10000,
 });
 
-let usersDB,
-  clubsDB,
-  usersCollection,
+let usersDB, clubsDB, paymentsDB;
+let usersCollection,
   applicationsCollection,
   clubsCollection,
   membershipsCollection,
   eventsCollection,
-  eventRegistrationsCollection;
-
+  eventRegistrationsCollection,
+  paymentsCollection;
 async function connectDB() {
-  if (!usersDB || !clubsDB) {
+  if (!usersDB || !clubsDB || !paymentsDB) {
     await client.connect();
     usersDB = client.db("usersDB");
     clubsDB = client.db("clubsDB");
+    paymentsDB = client.db("paymentsDB");
     usersCollection = usersDB.collection("usersCollection");
     applicationsCollection = usersDB.collection("applicationsCollection");
     clubsCollection = clubsDB.collection("clubsCollection");
@@ -62,10 +63,9 @@ async function connectDB() {
     eventRegistrationsCollection = clubsDB.collection(
       "eventRegistrationsCollection"
     );
-
+    paymentsCollection = paymentsDB.collection("paymentsCollection");
     console.log("Connected to MongoDB");
   }
-
   return {
     usersCollection,
     applicationsCollection,
@@ -73,88 +73,63 @@ async function connectDB() {
     membershipsCollection,
     eventsCollection,
     eventRegistrationsCollection,
+    paymentsCollection,
   };
 }
-
 async function createIndexes() {
   try {
     const {
       membershipsCollection,
       eventsCollection,
       eventRegistrationsCollection,
+      paymentsCollection,
     } = await connectDB();
-
-    // Drop old problematic indexes first
+    // Drop old indexes
     try {
       await membershipsCollection.dropIndex("userEmail_1_clubId_1_paymentId_1");
-      console.log("Dropped old memberships index");
-    } catch (e) {
-      // Index doesn't exist, that's fine
-    }
-
-    try {
       await membershipsCollection.dropIndex("paymentId_1");
-      console.log("Dropped old paymentId index");
     } catch (e) {
-      // Index doesn't exist, that's fine
+      // Indexes don't exist, continue
     }
-
-    // Memberships indexes - FIXED
-    // 1. Prevent duplicate active memberships per user-club
+    // Memberships indexes
     await membershipsCollection.createIndex(
       { userEmail: 1, clubId: 1, status: 1 },
       { unique: true, sparse: true }
     );
-    console.log("Created index: userEmail_clubId_status");
-
-    // 2. Index for payment lookup (paymentId can be null for free clubs)
     await membershipsCollection.createIndex({ paymentId: 1 }, { sparse: true });
-    console.log("Created index: paymentId");
-
-    // 3. General lookup indexes
     await membershipsCollection.createIndex({ userEmail: 1 });
-    console.log("Created index: userEmail");
-
     await membershipsCollection.createIndex({ clubId: 1 });
-    console.log("Created index: clubId");
-
     // Events indexes
     await eventsCollection.createIndex({ clubId: 1 });
-    console.log("Created index: events.clubId");
-
     await eventsCollection.createIndex({ createdAt: -1 });
-    console.log("Created index: events.createdAt");
-
     // Event Registrations indexes
     await eventRegistrationsCollection.createIndex(
       { eventId: 1, userEmail: 1 },
       { unique: true, sparse: true }
     );
-    console.log("Created index: eventId_userEmail");
-
     await eventRegistrationsCollection.createIndex({ userEmail: 1 });
-    console.log("Created index: eventRegistrations.userEmail");
-
     await eventRegistrationsCollection.createIndex({ eventId: 1 });
-    console.log("Created index: eventRegistrations.eventId");
-
-    console.log("✅ Database indexes created successfully");
+    // Payments indexes
+    await paymentsCollection.createIndex(
+      { transactionId: 1 },
+      { unique: true }
+    );
+    await paymentsCollection.createIndex({ userEmail: 1 });
+    await paymentsCollection.createIndex({ paymentType: 1 });
+    await paymentsCollection.createIndex({ status: 1 });
+    await paymentsCollection.createIndex({ createdAt: -1 });
   } catch (err) {
-    console.error("❌ Error creating indexes:", err.message);
+    console.error("Error creating indexes:", err.message);
   }
 }
-
 // Call this after connecting
 connectDB().then(() => createIndexes());
 
-// -------------------------------
-// MIDDLEWARE
-// -------------------------------
+// Custom Middlewares
 const verifyFireBaseToken = async (req, res, next) => {
   const authorization = req.headers.authorization;
   if (!authorization)
     return res.status(401).send({ message: "unauthorized access" });
-
   const token = authorization.split(" ")[1];
   try {
     const decoded = await admin.auth().verifyIdToken(token);
@@ -164,12 +139,10 @@ const verifyFireBaseToken = async (req, res, next) => {
     return res.status(401).send({ message: "unauthorized access" });
   }
 };
-
 const verifyAdmin = async (req, res, next) => {
   try {
     const { usersCollection } = await connectDB();
     const user = await usersCollection.findOne({ email: req.token_email });
-
     if (user?.role !== "admin") {
       return res.status(403).send({ message: "forbidden access" });
     }
@@ -179,20 +152,16 @@ const verifyAdmin = async (req, res, next) => {
     res.status(500).send({ message: "Internal server error" });
   }
 };
-
 const verifyClubManager = async (req, res, next) => {
   try {
     const { usersCollection } = await connectDB();
     const user = await usersCollection.findOne({ email: req.token_email });
-
     if (!user) {
       return res.status(404).send({ message: "User not found" });
     }
-
     if (user.role !== "clubManager" && user.role !== "admin") {
       return res.status(403).send({ message: "forbidden access" });
     }
-
     next();
   } catch (e) {
     console.error(e);
@@ -200,135 +169,317 @@ const verifyClubManager = async (req, res, next) => {
   }
 };
 
-// -------------------------------
-// ROUTES
-// -------------------------------
+// Helper Functions
+async function recordPayment(paymentData) {
+  const { paymentsCollection } = await connectDB();
+  const payment = {
+    transactionId: paymentData.transactionId,
+    userEmail: paymentData.userEmail,
+    paymentType: paymentData.paymentType,
+    amount: paymentData.amount,
+    currency: "usd",
+    status: paymentData.status,
+    relatedId: paymentData.relatedId,
+    relatedName: paymentData.relatedName,
+    paymentMethod: "stripe",
+    stripeSessionId: paymentData.stripeSessionId,
+    stripePlatformFee: paymentData.stripePlatformFee || 0,
+    netAmount: paymentData.amount - (paymentData.stripePlatformFee || 0),
+    description: paymentData.description,
+    metadata: paymentData.metadata || {},
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  console.log("Recording payment:", payment);
+  return await paymentsCollection.insertOne(payment);
+}
+async function verifyClubOwnership(clubId, managerEmail) {
+  const { clubsCollection, usersCollection } = await connectDB();
+  const club = await clubsCollection.findOne({ _id: new ObjectId(clubId) });
+  if (!club) return { authorized: false, club: null };
+  const user = await usersCollection.findOne({ email: managerEmail });
+  const authorized =
+    club.managerEmail === managerEmail || user?.role === "admin";
+  return { authorized, club };
+}
+async function verifyEventOwnership(eventId, managerEmail) {
+  const { eventsCollection, clubsCollection, usersCollection } =
+    await connectDB();
+  const event = await eventsCollection.findOne({ _id: new ObjectId(eventId) });
+  if (!event) return { authorized: false, event: null };
+  const club = await clubsCollection.findOne({ _id: event.clubId });
+  const user = await usersCollection.findOne({ email: managerEmail });
+  const authorized =
+    club?.managerEmail === managerEmail || user?.role === "admin";
+  return { authorized, event };
+}
 
+/*===== Public routes =====*/
+// Server startup
+app.listen(port, () => console.log(`Backend running on port ${port}`));
+// The default route
 app.get("/", (req, res) => res.send("Hello from backend!"));
-
-// -------------------------------
-// GET USER ROLE
-// -------------------------------
+// Get a user's role
 app.get("/users/role/:email", async (req, res) => {
   try {
     const { usersCollection } = await connectDB();
     const result = await usersCollection.findOne({ email: req.params.email });
-
     if (!result)
       return res.status(404).send({ message: "User role not found" });
-
     res.send(result);
   } catch (e) {
     console.error(e);
     res.status(500).send({ message: "Internal server error" });
   }
 });
-
-// -------------------------------
-// UPDATE USER ROLE (PROMOTE/DEMOTE)
-// -------------------------------
-app.patch(
-  "/users/role/:id",
-  verifyFireBaseToken,
-  verifyAdmin,
-  async (req, res) => {
-    try {
-      const { usersCollection, applicationsCollection } = await connectDB();
-      const { type } = req.body;
-      const id = req.params.id;
-
-      const user = await usersCollection.findOne({ _id: new ObjectId(id) });
-      if (!user) return res.status(404).send({ message: "User not found" });
-
-      let newRole = user.role;
-
-      // ------------------------------
-      // ROLE UPDATE LOGIC
-      // ------------------------------
-      if (type === "promote") {
-        if (user.role === "member") newRole = "clubManager";
-        else if (user.role === "clubManager") newRole = "admin";
-      } else if (type === "demote") {
-        if (user.role === "clubManager") newRole = "member";
-      }
-
-      // Apply the role change
-      const updateResult = await usersCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { role: newRole } }
-      );
-
-      // ------------------------------
-      // APPLICATION SYNCING LOGIC
-      // ------------------------------
-      const application = await applicationsCollection.findOne({
-        email: user.email,
-      });
-
-      if (application) {
-        // Case 1: Promote → approve pending app
-        if (type === "promote" && ["clubManager", "admin"].includes(newRole)) {
-          if (application.status === "pending") {
-            await applicationsCollection.updateOne(
-              { email: user.email },
-              { $set: { status: "approved" } }
-            );
-          }
-        }
-
-        // Case 2: Demote → convert approved → pending
-        if (type === "demote" && newRole === "member") {
-          if (application.status === "approved") {
-            await applicationsCollection.updateOne(
-              { email: user.email },
-              { $set: { status: "pending" } }
-            );
-          }
-        }
-      }
-
-      res.send({
-        message: "Role updated & application synced",
-        newRole,
-      });
-    } catch (error) {
-      console.error(error);
-      res.status(500).send({ message: "Internal server error" });
-    }
+// Add new user
+app.post("/users", async (req, res) => {
+  try {
+    const { usersCollection } = await connectDB();
+    const { name, email, photoURL, createdAt } = req.body;
+    const exists = await usersCollection.findOne({ email });
+    if (exists) return res.status(409).send({ message: "User already exists" });
+    const result = await usersCollection.insertOne({
+      name,
+      email,
+      photoURL,
+      createdAt: createdAt || new Date(),
+      role: "member",
+    });
+    res.status(201).send({ message: "User created", id: result.insertedId });
+  } catch (e) {
+    res.status(500).send({ message: "Internal server error" });
   }
-);
+});
+// List all clubs with filters
+app.get("/clubs", async (req, res) => {
+  try {
+    const { search, category, minFee, maxFee, status } = req.query;
+    const { clubsCollection } = await connectDB();
 
-// -------------------------------
-// APPLY FOR CLUB MANAGER
-// -------------------------------
+    // Build filter object
+    const filter = {};
+
+    // Search by club name or description
+    if (search && search.trim()) {
+      filter.$or = [
+        { clubName: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+        { location: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    // Filter by category
+    if (category && category.trim()) {
+      filter.category = category;
+    }
+
+    // Filter by membership fee range
+    if (minFee || maxFee) {
+      filter.membershipFee = {};
+      if (minFee) filter.membershipFee.$gte = parseFloat(minFee);
+      if (maxFee) filter.membershipFee.$lte = parseFloat(maxFee);
+    }
+
+    // Filter by status
+    if (status) {
+      filter.status = status;
+    }
+
+    // Execute query
+    const clubs = await clubsCollection
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.json({
+      success: true,
+      data: clubs,
+      count: clubs.length,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: error.message });
+  }
+});
+// Get club categories
+app.get("/clubs/categories", async (req, res) => {
+  try {
+    const { clubsCollection } = await connectDB();
+
+    const categories = await clubsCollection
+      .aggregate([
+        { $match: { status: "approved" } },
+        { $group: { _id: "$category" } },
+        { $sort: { _id: 1 } },
+      ])
+      .toArray();
+
+    res.json({
+      success: true,
+      data: categories.map((c) => c._id).filter(Boolean),
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: error.message });
+  }
+});
+// Fetch club details
+app.get("/clubs/details/:param", async (req, res) => {
+  try {
+    const { clubsCollection } = await connectDB();
+    const param = req.params.param;
+    if (!ObjectId.isValid(param))
+      return res.status(400).send({ message: "Invalid club ID" });
+    const club = await clubsCollection.findOne({ _id: new ObjectId(param) });
+    if (!club) return res.status(404).send({ message: "Club not found" });
+    res.send(club);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+// List all events with filters
+app.get("/events", async (req, res) => {
+  try {
+    const {
+      search,
+      clubId,
+      location,
+      isPaid,
+      minDate,
+      maxDate,
+      sort,
+      limit = 0,
+    } = req.query;
+    const { eventsCollection } = await connectDB();
+
+    // Build filter object
+    const filter = {};
+
+    // Search by event title or description
+    if (search && search.trim()) {
+      filter.$or = [
+        { title: { $regex: search, $options: "i" } },
+        { description: { $regex: search, $options: "i" } },
+      ];
+    }
+
+    // Filter by club
+    if (clubId && clubId.trim()) {
+      filter.clubId = new ObjectId(clubId);
+    }
+
+    // Filter by location
+    if (location && location.trim()) {
+      filter.location = { $regex: location, $options: "i" };
+    }
+
+    // Filter by paid/free
+    if (isPaid !== undefined && isPaid !== "") {
+      filter.isPaid = isPaid === "true" || isPaid === true;
+    }
+
+    // Filter by date range
+    if (minDate || maxDate) {
+      filter.eventDate = {};
+      if (minDate) filter.eventDate.$gte = new Date(minDate);
+      if (maxDate) filter.eventDate.$lte = new Date(maxDate);
+    }
+
+    // Determine sort
+    let sortObj = { createdAt: -1 }; // Default: newest first
+    if (sort === "oldest") {
+      sortObj = { createdAt: 1 };
+    } else if (sort === "highest-fee") {
+      sortObj = { eventFee: -1 };
+    } else if (sort === "lowest-fee") {
+      sortObj = { eventFee: 1 };
+    } else if (sort === "upcoming") {
+      sortObj = { eventDate: 1 };
+    }
+
+    // Execute query
+    let query = eventsCollection.find(filter).sort(sortObj);
+
+    if (parseInt(limit) > 0) {
+      query = query.limit(parseInt(limit));
+    }
+
+    const events = await query.toArray();
+
+    res.json({
+      success: true,
+      data: events,
+      count: events.length,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: error.message });
+  }
+});
+// Get events of a specific club
+app.get("/clubs/:clubId/events", async (req, res) => {
+  try {
+    const { clubId } = req.params;
+    const { eventsCollection, clubsCollection } = await connectDB();
+    if (!ObjectId.isValid(clubId))
+      return res.status(400).send({ message: "Invalid club ID" });
+    const club = await clubsCollection.findOne({ _id: new ObjectId(clubId) });
+    if (!club) return res.status(404).send({ message: "Club not found" });
+    const events = await eventsCollection
+      .find({ clubId: new ObjectId(clubId) })
+      .sort({ eventDate: 1 })
+      .toArray();
+    res.send(events);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+// Get event details
+app.get("/events/:eventId", async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { eventsCollection } = await connectDB();
+    if (!ObjectId.isValid(eventId))
+      return res.status(400).send({ message: "Invalid event ID" });
+    const event = await eventsCollection.findOne({
+      _id: new ObjectId(eventId),
+    });
+    if (!event) return res.status(404).send({ message: "Event not found" });
+    res.send(event);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+
+/*===== Protected routes (for members) =====*/
+// Apply for Club Manager role
 app.post("/users/apply-club-manager", verifyFireBaseToken, async (req, res) => {
   try {
     const { usersCollection, applicationsCollection } = await connectDB();
     const email = req.token_email;
-
     const user = await usersCollection.findOne({ email });
     if (!user) return res.status(404).send({ message: "User not found" });
-
     if (user.role !== "member") {
       return res
         .status(400)
         .send({ message: "Only Members can apply for Club Manager" });
     }
-
     const existing = await applicationsCollection.findOne({ email });
     if (existing) {
       return res
         .status(400)
         .send({ message: "Already applied for Club Manager" });
     }
-
     const result = await applicationsCollection.insertOne({
       name: user.name,
       email,
       status: "pending",
       createdAt: new Date(),
     });
-
     res
       .status(201)
       .send({ message: "Application submitted", id: result.insertedId });
@@ -336,246 +487,147 @@ app.post("/users/apply-club-manager", verifyFireBaseToken, async (req, res) => {
     res.status(500).send({ message: "Internal server error" });
   }
 });
-
-// -------------------------------
-// LIST ALL CLUB MANAGER APPLICATIONS
-// -------------------------------
-app.get(
-  "/admin/club-manager-applications",
-  verifyFireBaseToken,
-  verifyClubManager,
-  async (req, res) => {
-    try {
-      //const { clubsCollection } = await connectDB();
-      const { applicationsCollection } = await connectDB();
-      const apps = await applicationsCollection.find({}).toArray();
-
-      res.send(apps);
-    } catch (e) {
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// APPROVE CLUB MANAGER APPLICATION
-// -------------------------------
-app.patch(
-  "/admin/club-manager-applications",
-  verifyFireBaseToken,
-  verifyAdmin,
-  async (req, res) => {
-    try {
-      const { email } = req.body;
-      const { usersCollection, applicationsCollection } = await connectDB();
-
-      if (!email) return res.status(400).send({ message: "Email is required" });
-
-      const application = await applicationsCollection.findOne({
-        email,
-        status: "pending",
-      });
-      if (!application) {
-        return res
-          .status(404)
-          .send({ message: "Application not found or already approved" });
-      }
-
-      await usersCollection.updateOne(
-        { email },
-        { $set: { role: "clubManager" } }
-      );
-      await applicationsCollection.updateOne(
-        { email },
-        { $set: { status: "approved" } }
-      );
-
-      res.send({ message: "Application approved" });
-    } catch (e) {
-      console.error(e);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// CHECK APPLICATION STATUS
-// -------------------------------
+// Check Club Manager application status
 app.get(
   "/users/apply-club-manager/status",
   verifyFireBaseToken,
   async (req, res) => {
     try {
       const { applicationsCollection } = await connectDB();
-      const email = req.token_email;
-
-      const appStatus = await applicationsCollection.findOne({ email });
-
-      if (!appStatus) return res.send({ found: false });
-
-      res.send({ found: true, application: appStatus });
+      const appStatus = await applicationsCollection.findOne({
+        email: req.token_email,
+      });
+      res.send(
+        appStatus ? { found: true, application: appStatus } : { found: false }
+      );
     } catch (e) {
       res.status(500).send({ message: "Internal server error" });
     }
   }
 );
-
-// -------------------------------
-// ADD USER
-// -------------------------------
-app.post("/users", async (req, res) => {
-  try {
-    const { usersCollection } = await connectDB();
-    const user = req.body;
-
-    const exists = await usersCollection.findOne({ email: user.email });
-    if (exists) return res.status(409).send({ message: "User already exists" });
-
-    const newUser = {
-      name: user.name,
-      email: user.email,
-      photoURL: user.photoURL,
-      createdAt: user.createdAt || new Date(),
-      role: "member",
-    };
-
-    const result = await usersCollection.insertOne(newUser);
-    res.status(201).send({ message: "User created", id: result.insertedId });
-  } catch (e) {
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// -------------------------------
-// LIST ALL USERS
-// -------------------------------
-app.get("/users", verifyFireBaseToken, verifyAdmin, async (req, res) => {
-  try {
-    const { usersCollection } = await connectDB();
-    const users = await usersCollection.find().toArray();
-
-    res.send(users);
-  } catch (e) {
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// -------------------------------
-// LIST ALL EVENTS
-// -------------------------------
-app.get("/events", async (req, res) => {
-  try {
-    const { eventsCollection } = await connectDB();
-    let clubId = req.query.clubId;
-    let limit = parseInt(req.query.limit, 10);
-
-    if (isNaN(limit) || limit <= 0) {
-      limit = 0;
-    }
-
-    let query = {};
-
-    if (clubId) {
-      query = { clubId: new ObjectId(clubId) };
-    }
-    const events = await eventsCollection
-      .find(query)
-      .sort({ _id: -1 })
-      .limit(limit)
-      .toArray();
-    res.send(events);
-  } catch (e) {
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// -------------------------------
-// FETCH A CLUB
-// -------------------------------
-app.get("/clubs/details/:param", async (req, res) => {
-  try {
-    const param = req.params.param;
-    const { clubsCollection } = await connectDB();
-
-    const isObjectId = ObjectId.isValid(param);
-
-    if (isObjectId) {
-      const club = await clubsCollection.findOne({
-        _id: new ObjectId(param),
-      });
-
-      if (!club) {
-        return res.status(404).send({ message: "Club not found" });
-      }
-
-      return res.send(club);
-    }
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// -------------------------------
-// FETCH A CLUB FOR ADMIN
-// -------------------------------
+// Get member payment statistics
 app.get(
-  "/clubs/:param",
+  "/member/payments/statistics",
   verifyFireBaseToken,
-  verifyClubManager,
   async (req, res) => {
     try {
-      const param = req.params.param;
-      const { clubsCollection, usersCollection } = await connectDB();
+      const userEmail = req.token_email;
+      const { paymentsCollection } = await connectDB();
 
-      const isObjectId = ObjectId.isValid(param);
-
-      if (isObjectId) {
-        const club = await clubsCollection.findOne({
-          _id: new ObjectId(param),
-        });
-
-        if (!club) {
-          return res.status(404).send({ message: "Club not found" });
-        }
-
-        if (club.managerEmail !== req.token_email) {
-          const user = await usersCollection.findOne({
-            email: req.token_email,
-          });
-
-          if (user?.role !== "admin") {
-            return res.status(403).send({
-              message: "You are not authorized to access this club",
-            });
-          }
-        }
-
-        return res.send(club);
-      }
-      const email = param;
-
-      if (email !== req.token_email) {
-        return res.status(403).send({
-          message: "You are not authorized to view clubs of other managers",
-        });
-      }
-
-      const clubs = await clubsCollection
-        .find({ managerEmail: email })
+      // Overall statistics
+      const totalStats = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              userEmail,
+              status: "completed",
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              totalSpent: { $sum: "$amount" },
+              totalTransactions: { $sum: 1 },
+            },
+          },
+        ])
         .toArray();
 
-      return res.send(clubs);
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
+      // Revenue by type
+      const spendingByType = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              userEmail,
+              status: "completed",
+            },
+          },
+          {
+            $group: {
+              _id: "$paymentType",
+              amount: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray();
+
+      // Membership spending specifically
+      const membershipStats = spendingByType.find(
+        (r) => r._id === "membership"
+      ) || { amount: 0, count: 0 };
+
+      // Event spending specifically
+      const eventStats = spendingByType.find((r) => r._id === "event") || {
+        amount: 0,
+        count: 0,
+      };
+
+      // Monthly spending
+      const monthlySpending = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              userEmail,
+              status: "completed",
+            },
+          },
+          {
+            $addFields: {
+              createdAtDate: {
+                $cond: [
+                  { $eq: [{ $type: "$createdAt" }, "date"] },
+                  "$createdAt",
+                  { $toDate: "$createdAt" },
+                ],
+              },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%b %Y",
+                  date: "$createdAtDate",
+                },
+              },
+              amount: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+          {
+            $project: {
+              _id: 0,
+              month: "$_id",
+              amount: { $round: ["$amount", 2] },
+              count: 1,
+            },
+          },
+        ])
+        .toArray();
+
+      const stats = totalStats[0] || {
+        totalSpent: 0,
+        totalTransactions: 0,
+      };
+
+      res.json({
+        ...stats,
+        membershipSpent: membershipStats.amount || 0,
+        eventSpent: eventStats.amount || 0,
+        membershipCount: membershipStats.count || 0,
+        eventCount: eventStats.count || 0,
+        spendingByType,
+        monthlySpending,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: error.message });
     }
   }
 );
-
-// -------------------------------
-// CHECK MEMBERSHIP STATUS
-// -------------------------------
+// Check membership status for a club
 app.get(
   "/clubs/:clubId/membership-status",
   verifyFireBaseToken,
@@ -583,41 +635,23 @@ app.get(
     try {
       const { clubId } = req.params;
       const email = req.token_email;
-
       const { membershipsCollection } = await connectDB();
-
-      if (!ObjectId.isValid(clubId)) {
+      if (!ObjectId.isValid(clubId))
         return res.status(400).send({ message: "Invalid club ID" });
-      }
-
-      // Find membership record
       const membership = await membershipsCollection.findOne({
         userEmail: email,
         clubId: new ObjectId(clubId),
       });
-
-      // No membership found
-      if (!membership) {
-        return res.send({
-          isMember: false,
-          status: "none",
-        });
-      }
-
+      if (!membership) return res.send({ isMember: false, status: "none" });
       // Auto-expire expired memberships
-      if (
-        membership.expiresAt &&
-        new Date(membership.expiresAt).getTime() < Date.now()
-      ) {
+      if (membership.expiresAt && new Date(membership.expiresAt) < new Date()) {
         await membershipsCollection.updateOne(
           { _id: membership._id },
           { $set: { status: "expired" } }
         );
-
         membership.status = "expired";
       }
-
-      return res.send({
+      res.send({
         isMember: membership.status === "active",
         status: membership.status,
         paymentId: membership.paymentId || null,
@@ -630,258 +664,36 @@ app.get(
     }
   }
 );
-
-// -------------------------------
-// ADD NEW CLUB (MANAGER / ADMIN)
-// -------------------------------
-app.post("/clubs", verifyFireBaseToken, verifyClubManager, async (req, res) => {
-  try {
-    const { clubsCollection } = await connectDB();
-    const managerEmail = req.token_email;
-
-    const {
-      clubName,
-      description,
-      category,
-      location,
-      bannerImage,
-      membershipFee,
-    } = req.body;
-
-    // Validate required fields
-    if (!clubName || !description || !category || !location || !bannerImage) {
-      return res
-        .status(400)
-        .send({ message: "All required fields must be provided" });
-    }
-
-    const newClub = {
-      clubName,
-      description,
-      category,
-      location,
-      bannerImage,
-      membershipFee: Number(membershipFee) || 0,
-      managerEmail,
-      status: "pending", // new clubs must be approved
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-
-    const result = await clubsCollection.insertOne(newClub);
-
-    res.status(201).send({
-      message: "Club submitted successfully",
-      id: result.insertedId,
-      club: newClub,
-    });
-  } catch (e) {
-    console.error(e);
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// -------------------------------
-// UPDATE CLUB DETAILS (MANAGER / ADMIN)
-// -------------------------------
-app.patch(
-  "/clubs/:id",
-  verifyFireBaseToken,
-  verifyClubManager,
-  async (req, res) => {
-    try {
-      const { clubsCollection, usersCollection } = await connectDB();
-      const id = req.params.id;
-
-      const existingClub = await clubsCollection.findOne({
-        _id: new ObjectId(id),
-      });
-
-      if (!existingClub) {
-        return res.status(404).send({ message: "Club not found" });
-      }
-
-      // Only owner or admin can edit
-      const user = await usersCollection.findOne({
-        email: req.token_email,
-      });
-
-      if (
-        existingClub.managerEmail !== req.token_email &&
-        user?.role !== "admin"
-      ) {
-        return res
-          .status(403)
-          .send({ message: "Not authorized to update this club" });
-      }
-
-      const {
-        clubName,
-        description,
-        category,
-        location,
-        membershipFee,
-        bannerImage,
-      } = req.body;
-
-      const updateDoc = {
-        $set: {
-          clubName,
-          description,
-          category,
-          location,
-          membershipFee: Number(membershipFee),
-          bannerImage,
-          updatedAt: new Date(),
-        },
-      };
-
-      await clubsCollection.updateOne({ _id: new ObjectId(id) }, updateDoc);
-
-      res.send({ message: "Club updated successfully" });
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// DELETE A CLUB
-// -------------------------------
-app.delete(
-  "/clubs/:id",
-  verifyFireBaseToken,
-  verifyClubManager,
-  async (req, res) => {
-    try {
-      const { clubsCollection, usersCollection } = await connectDB();
-      const id = req.params.id;
-
-      const club = await clubsCollection.findOne({
-        _id: new ObjectId(id),
-      });
-
-      if (!club) {
-        return res.status(404).send({ message: "Club not found" });
-      }
-
-      // Get user role from database
-      const user = await usersCollection.findOne({ email: req.token_email });
-
-      if (club.managerEmail !== req.token_email && user?.role !== "admin") {
-        return res
-          .status(403)
-          .send({ message: "Not authorized to delete this club" });
-      }
-
-      await clubsCollection.deleteOne({ _id: new ObjectId(id) });
-
-      res.send({ message: "Club deleted successfully" });
-    } catch (e) {
-      console.error(e);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// LIST ALL CLUBS
-// -------------------------------
-app.get("/clubs", async (req, res) => {
-  try {
-    let limit = parseInt(req.query.limit, 10);
-
-    if (isNaN(limit) || limit <= 0) {
-      limit = 0;
-    }
-
-    const { clubsCollection } = await connectDB();
-
-    const clubs = await clubsCollection
-      .find()
-      .sort({ _id: -1 })
-      .limit(limit)
-      .toArray();
-
-    res.send(clubs);
-  } catch (error) {
-    console.error(error);
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// -------------------------------
-// CLUBS APPROVAL FOR ADMIN
-// -------------------------------
-app.patch(
-  "/clubs/status/:id",
-  verifyFireBaseToken,
-  verifyAdmin,
-  async (req, res) => {
-    try {
-      const { clubsCollection } = await connectDB();
-      const id = req.params.id;
-      const { status } = req.body;
-
-      if (!["pending", "approved", "rejected"].includes(status)) {
-        return res.status(400).send({ message: "Invalid status" });
-      }
-
-      const result = await clubsCollection.updateOne(
-        { _id: new ObjectId(id) },
-        { $set: { status, updatedAt: new Date() } }
-      );
-
-      res.send({ message: `Club ${status}`, result });
-    } catch (e) {
-      console.error(e);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// JOIN CLUB (CREATE PAYMENT INTENT)
-// -------------------------------
+// Join a club (creates membership & payment intent)
 app.post("/clubs/:clubId/join", verifyFireBaseToken, async (req, res) => {
   try {
     const { clubId } = req.params;
     const userEmail = req.token_email;
     const { clubsCollection, membershipsCollection } = await connectDB();
-
     if (!ObjectId.isValid(clubId)) {
       return res.status(400).send({ message: "Invalid club ID" });
     }
-
-    // Check if already an active member
     const existingMembership = await membershipsCollection.findOne({
       userEmail,
       clubId: new ObjectId(clubId),
       status: "active",
     });
-
     if (existingMembership) {
       return res
         .status(400)
         .send({ message: "Already an active member of this club" });
     }
-
-    // Get club details
     const club = await clubsCollection.findOne({
       _id: new ObjectId(clubId),
     });
-
     if (!club) {
       return res.status(404).send({ message: "Club not found" });
     }
-
     if (club.status !== "approved") {
       return res
         .status(400)
         .send({ message: "This club is not available for membership" });
     }
-
     // If free membership
     if (!club.membershipFee || club.membershipFee === 0) {
       const newMembership = {
@@ -892,15 +704,25 @@ app.post("/clubs/:clubId/join", verifyFireBaseToken, async (req, res) => {
         expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // 1 year
         paymentId: null,
       };
-
       try {
         const result = await membershipsCollection.insertOne(newMembership);
+        // RECORD PAYMENT ✅ - ADD THIS (free membership payment record)
+        await recordPayment({
+          transactionId: `free-${clubId}-${userEmail}-${Date.now()}`,
+          userEmail,
+          paymentType: "membership",
+          amount: 0,
+          status: "completed",
+          relatedId: clubId,
+          relatedName: club.clubName,
+          description: `Free membership for ${club.clubName}`,
+          stripeSessionId: null,
+        });
         return res.send({
           message: "Joined club successfully",
           membershipId: result.insertedId,
         });
       } catch (dbError) {
-        // Handle duplicate key error for free clubs
         if (dbError.code === 11000) {
           return res.status(400).send({
             message: "Already a member of this club",
@@ -912,7 +734,7 @@ app.post("/clubs/:clubId/join", verifyFireBaseToken, async (req, res) => {
 
     // Create Stripe Payment Intent for paid clubs
     const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(club.membershipFee * 100), // Convert to cents
+      amount: Math.round(club.membershipFee * 100),
       currency: "usd",
       metadata: {
         clubId: clubId,
@@ -920,7 +742,6 @@ app.post("/clubs/:clubId/join", verifyFireBaseToken, async (req, res) => {
         clubName: club.clubName,
       },
     });
-
     res.send({
       clientSecret: paymentIntent.client_secret,
       amount: club.membershipFee,
@@ -932,10 +753,7 @@ app.post("/clubs/:clubId/join", verifyFireBaseToken, async (req, res) => {
     res.status(500).send({ message: "Internal server error" });
   }
 });
-
-// -------------------------------
-// CONFIRM PAYMENT & CREATE MEMBERSHIP
-// -------------------------------
+// Confirm membership payment
 app.post(
   "/clubs/:clubId/confirm-payment",
   verifyFireBaseToken,
@@ -954,7 +772,6 @@ app.post(
       const paymentIntent = await stripe.paymentIntents.retrieve(
         paymentIntentId
       );
-
       if (paymentIntent.status !== "succeeded") {
         return res.status(400).send({ message: "Payment not completed" });
       }
@@ -972,19 +789,39 @@ app.post(
           .send({ message: "Membership already created for this payment" });
       }
 
+      const club = await clubsCollection.findOne({
+        _id: new ObjectId(clubId),
+      });
+      if (!club) {
+        return res.status(404).send({ message: "Club not found" });
+      }
+
       // Create membership record
       const newMembership = {
         userEmail,
         clubId: new ObjectId(clubId),
         status: "active",
         joinedAt: new Date(),
-        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // 1 year
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
         paymentId: paymentIntentId,
         amount: paymentIntent.amount / 100,
         createdAt: new Date(),
       };
 
       const result = await membershipsCollection.insertOne(newMembership);
+
+      // RECORD PAYMENT ✅ - ADD THIS
+      await recordPayment({
+        transactionId: paymentIntentId,
+        userEmail,
+        paymentType: "membership",
+        amount: paymentIntent.amount / 100,
+        status: "completed",
+        relatedId: clubId,
+        relatedName: club.clubName,
+        description: `Membership payment for ${club.clubName}`,
+        stripeSessionId: paymentIntentId,
+      });
 
       res.send({
         message: "Membership activated successfully",
@@ -997,10 +834,222 @@ app.post(
     }
   }
 );
-
-// -------------------------------
-// RENEW MEMBERSHIP
-// -------------------------------
+// Register for Event
+app.post("/events/:eventId/register", verifyFireBaseToken, async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const userEmail = req.token_email;
+    const { eventsCollection, eventRegistrationsCollection } =
+      await connectDB();
+    if (!ObjectId.isValid(eventId)) {
+      return res.status(400).send({ message: "Invalid event ID" });
+    }
+    const event = await eventsCollection.findOne({
+      _id: new ObjectId(eventId),
+    });
+    if (!event) return res.status(404).send({ message: "Event not found" });
+    const existingRegistration = await eventRegistrationsCollection.findOne({
+      eventId: new ObjectId(eventId),
+      userEmail,
+    });
+    if (existingRegistration) {
+      return res
+        .status(400)
+        .send({ message: "Already registered for this event" });
+    }
+    if (event.maxAttendees && event.attendeeCount >= event.maxAttendees) {
+      return res.status(400).send({ message: "Event is full" });
+    }
+    // Free event
+    if (!event.isPaid || event.eventFee === 0) {
+      const registration = {
+        eventId: new ObjectId(eventId),
+        userEmail,
+        clubId: event.clubId,
+        status: "registered",
+        registeredAt: new Date(),
+        paymentId: null,
+      };
+      const result = await eventRegistrationsCollection.insertOne(registration);
+      await eventsCollection.updateOne(
+        { _id: new ObjectId(eventId) },
+        { $inc: { attendeeCount: 1 } }
+      );
+      return res.send({
+        message: "Registered successfully",
+        registrationId: result.insertedId,
+      });
+    }
+    // Paid event - create payment intent
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount: Math.round(event.eventFee * 100),
+      currency: "usd",
+      metadata: {
+        eventId,
+        userEmail,
+        clubId: event.clubId.toString(),
+        type: "eventRegistration",
+      },
+    });
+    res.send({
+      clientSecret: paymentIntent.client_secret,
+      amount: event.eventFee,
+      eventTitle: event.title,
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Internal server error" });
+  }
+});
+// Create Event Registration Checkout Session
+app.post(
+  "/events/:eventId/create-registration-session",
+  verifyFireBaseToken,
+  async (req, res) => {
+    try {
+      const { eventId } = req.params;
+      const userEmail = req.token_email;
+      const { eventsCollection, eventRegistrationsCollection } =
+        await connectDB();
+      if (!ObjectId.isValid(eventId)) {
+        return res.status(400).send({ message: "Invalid event ID" });
+      }
+      const event = await eventsCollection.findOne({
+        _id: new ObjectId(eventId),
+      });
+      if (!event) return res.status(404).send({ message: "Event not found" });
+      const existingRegistration = await eventRegistrationsCollection.findOne({
+        eventId: new ObjectId(eventId),
+        userEmail,
+      });
+      if (existingRegistration) {
+        return res
+          .status(400)
+          .send({ message: "Already registered for this event" });
+      }
+      if (event.maxAttendees && event.attendeeCount >= event.maxAttendees) {
+        return res.status(400).send({ message: "Event is full" });
+      }
+      if (!event.isPaid || event.eventFee === 0) {
+        return res.status(400).send({ message: "This is a free event" });
+      }
+      const session = await stripe.checkout.sessions.create({
+        payment_method_types: ["card"],
+        line_items: [
+          {
+            price_data: {
+              currency: "usd",
+              product_data: {
+                name: `${event.title} - Registration`,
+                description: `Register for ${event.title}`,
+              },
+              unit_amount: Math.round(event.eventFee * 100),
+            },
+            quantity: 1,
+          },
+        ],
+        mode: "payment",
+        customer_email: userEmail,
+        success_url: `${clientUrl}/event-registration-success?eventId=${eventId}&sessionId={CHECKOUT_SESSION_ID}`,
+        cancel_url: `${clientUrl}/events/${eventId}`,
+        metadata: { eventId, userEmail, type: "eventRegistration" },
+      });
+      res.send({ url: session.url, sessionId: session.id });
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// Verify Event Registration Session
+app.post(
+  "/events/verify-registration-session",
+  verifyFireBaseToken,
+  async (req, res) => {
+    try {
+      const { sessionId } = req.body;
+      const userEmail = req.token_email;
+      const { eventsCollection, eventRegistrationsCollection } =
+        await connectDB();
+      if (!sessionId)
+        return res.status(400).send({ message: "Session ID required" });
+      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      if (session.payment_status !== "paid") {
+        return res.status(400).send({ message: "Payment not completed" });
+      }
+      const { eventId } = session.metadata;
+      const existingRegistration = await eventRegistrationsCollection.findOne({
+        eventId: new ObjectId(eventId),
+        userEmail,
+      });
+      if (existingRegistration) {
+        return res.send({
+          message: "Already registered for this event",
+          registrationId: existingRegistration._id,
+          alreadyRegistered: true,
+        });
+      }
+      const event = await eventsCollection.findOne({
+        _id: new ObjectId(eventId),
+      });
+      if (!event) return res.status(404).send({ message: "Event not found" });
+      if (event.maxAttendees && event.attendeeCount >= event.maxAttendees) {
+        return res.status(400).send({ message: "Event is full" });
+      }
+      try {
+        const registration = {
+          eventId: new ObjectId(eventId),
+          userEmail,
+          clubId: event.clubId,
+          status: "registered",
+          registeredAt: new Date(),
+          paymentId: sessionId,
+          amount: session.amount_total / 100,
+        };
+        const result = await eventRegistrationsCollection.insertOne(
+          registration
+        );
+        await eventsCollection.updateOne(
+          { _id: new ObjectId(eventId) },
+          { $inc: { attendeeCount: 1 } }
+        );
+        await recordPayment({
+          transactionId: sessionId,
+          userEmail,
+          paymentType: "event",
+          amount: session.amount_total / 100,
+          status: "completed",
+          relatedId: eventId,
+          relatedName: event.title,
+          description: `Event registration for ${event.title}`,
+          stripeSessionId: sessionId,
+        });
+        return res.send({
+          message: "Registration successful",
+          registrationId: result.insertedId,
+          success: true,
+        });
+      } catch (dbError) {
+        if (dbError.code === 11000) {
+          const existingReg = await eventRegistrationsCollection.findOne({
+            eventId: new ObjectId(eventId),
+            userEmail,
+          });
+          return res.send({
+            message: "Registration already exists for this payment",
+            registrationId: existingReg._id,
+            alreadyRegistered: true,
+          });
+        }
+        throw dbError;
+      }
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// Renew Membership
 app.post(
   "/clubs/:clubId/renew-membership",
   verifyFireBaseToken,
@@ -1013,22 +1062,18 @@ app.post(
       const club = await clubsCollection.findOne({
         _id: new ObjectId(clubId),
       });
-
       if (!club) {
         return res.status(404).send({ message: "Club not found" });
       }
-
       // If free club
       if (!club.membershipFee || club.membershipFee === 0) {
         const membership = await membershipsCollection.findOne({
           userEmail,
           clubId: new ObjectId(clubId),
         });
-
         if (!membership) {
           return res.status(404).send({ message: "Membership not found" });
         }
-
         await membershipsCollection.updateOne(
           { _id: membership._id },
           {
@@ -1038,10 +1083,8 @@ app.post(
             },
           }
         );
-
         return res.send({ message: "Membership renewed successfully" });
       }
-
       // Create Stripe Payment Intent for renewal
       const paymentIntent = await stripe.paymentIntents.create({
         amount: Math.round(club.membershipFee * 100),
@@ -1052,7 +1095,6 @@ app.post(
           type: "renewal",
         },
       });
-
       res.send({
         clientSecret: paymentIntent.client_secret,
         amount: club.membershipFee,
@@ -1064,10 +1106,7 @@ app.post(
     }
   }
 );
-
-// -------------------------------
-// CONFIRM RENEWAL PAYMENT
-// -------------------------------
+// Confirm Membership Renewal Payment
 app.post(
   "/clubs/:clubId/confirm-renewal",
   verifyFireBaseToken,
@@ -1076,12 +1115,11 @@ app.post(
       const { clubId } = req.params;
       const { paymentIntentId } = req.body;
       const userEmail = req.token_email;
-      const { membershipsCollection } = await connectDB();
+      const { membershipsCollection, clubsCollection } = await connectDB();
 
       const paymentIntent = await stripe.paymentIntents.retrieve(
         paymentIntentId
       );
-
       if (paymentIntent.status !== "succeeded") {
         return res.status(400).send({ message: "Payment not completed" });
       }
@@ -1090,11 +1128,9 @@ app.post(
         userEmail,
         clubId: new ObjectId(clubId),
       });
-
-      if (!membership) {
+      if (!membership)
         return res.status(404).send({ message: "Membership not found" });
-      }
-
+      const club = await clubsCollection.findOne({ _id: new ObjectId(clubId) });
       await membershipsCollection.updateOne(
         { _id: membership._id },
         {
@@ -1102,10 +1138,24 @@ app.post(
             status: "active",
             expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
             paymentId: paymentIntentId,
+            renewedAt: new Date(),
           },
         }
       );
-
+      // RECORD PAYMENT ✅ - ADD THIS
+      await recordPayment({
+        transactionId: paymentIntentId,
+        userEmail,
+        paymentType: "membership",
+        amount: paymentIntent.amount / 100,
+        status: "completed",
+        relatedId: clubId,
+        relatedName: club?.clubName || "Unknown Club",
+        description: `Membership renewal for ${
+          club?.clubName || "Unknown Club"
+        }`,
+        stripeSessionId: paymentIntentId,
+      });
       res.send({ message: "Membership renewed successfully" });
     } catch (err) {
       console.error(err);
@@ -1113,10 +1163,213 @@ app.post(
     }
   }
 );
-
-// -------------------------------
-// CREATE CHECKOUT SESSION (JOIN)
-// -------------------------------
+// Remove Membership
+app.delete(
+  "/memberships/:membershipId",
+  verifyFireBaseToken,
+  async (req, res) => {
+    try {
+      const { membershipId } = req.params;
+      const userEmail = req.token_email;
+      const { membershipsCollection, clubsCollection, usersCollection } =
+        await connectDB();
+      if (!ObjectId.isValid(membershipId)) {
+        return res.status(400).send({ message: "Invalid membership ID" });
+      }
+      const membership = await membershipsCollection.findOne({
+        _id: new ObjectId(membershipId),
+      });
+      if (!membership)
+        return res.status(404).send({ message: "Membership not found" });
+      const user = await usersCollection.findOne({ email: userEmail });
+      const club = await clubsCollection.findOne({ _id: membership.clubId });
+      const isOwnMembership = membership.userEmail === userEmail;
+      const isClubManager = club && club.managerEmail === userEmail;
+      const isAdmin = user && user.role === "admin";
+      if (!isOwnMembership && !isClubManager && !isAdmin) {
+        return res
+          .status(403)
+          .send({ message: "Not authorized to remove this membership" });
+      }
+      await membershipsCollection.deleteOne({
+        _id: new ObjectId(membershipId),
+      });
+      res.send({ message: "Membership removed successfully" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// Get Member's Statistics
+app.get("/member/statistics", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const {
+      membershipsCollection,
+      eventRegistrationsCollection,
+      clubsCollection,
+    } = await connectDB();
+    const totalClubs = await membershipsCollection.countDocuments({
+      userEmail,
+      status: "active",
+    });
+    const eventsRegistered = await eventRegistrationsCollection.countDocuments({
+      userEmail,
+    });
+    // Club breakdown
+    const clubsBreakdown = await membershipsCollection
+      .aggregate([
+        { $match: { userEmail } },
+        {
+          $lookup: {
+            from: "clubsCollection",
+            localField: "clubId",
+            foreignField: "_id",
+            as: "club",
+          },
+        },
+        { $unwind: "$club" },
+        { $group: { _id: "$club.clubName", value: { $sum: 1 } } },
+        { $project: { name: "$_id", value: 1, _id: 0 } },
+      ])
+      .toArray();
+    // Event attendance history (last 6 months)
+    const sixMonthsAgo = new Date();
+    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+    const eventAttendanceHistory = await eventRegistrationsCollection
+      .aggregate([
+        { $match: { userEmail, registeredAt: { $gte: sixMonthsAgo } } },
+        {
+          $group: {
+            _id: {
+              year: { $year: "$registeredAt" },
+              month: { $month: "$registeredAt" },
+            },
+            attendance: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+        {
+          $project: {
+            name: {
+              $dateToString: {
+                format: "%b",
+                date: {
+                  $toDate: {
+                    $dateFromParts: {
+                      year: "$_id.year",
+                      month: "$_id.month",
+                      day: 1,
+                    },
+                  },
+                },
+              },
+            },
+            attendance: 1,
+            _id: 0,
+          },
+        },
+      ])
+      .toArray();
+    res.json({
+      totalClubs,
+      eventsRegistered,
+      clubsBreakdown,
+      eventAttendanceHistory,
+      clubsTrend: 5,
+      eventsTrend: 3,
+    });
+  } catch (error) {
+    console.error("Error fetching member stats:", error);
+    res.status(500).json({ message: "Error fetching stats" });
+  }
+});
+// Get Member's Clubs
+app.get("/member/clubs", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const { membershipsCollection } = await connectDB();
+    const clubs = await membershipsCollection
+      .aggregate([
+        { $match: { userEmail } },
+        {
+          $lookup: {
+            from: "clubsCollection",
+            localField: "clubId",
+            foreignField: "_id",
+            as: "club",
+          },
+        },
+        { $unwind: "$club" },
+        {
+          $project: {
+            _id: "$club._id",
+            clubName: "$club.clubName",
+            description: "$club.description",
+            bannerImage: "$club.bannerImage",
+            category: "$club.category",
+            membershipStatus: "$status",
+            joinedAt: "$joinedAt",
+            expiresAt: "$expiresAt",
+          },
+        },
+      ])
+      .toArray();
+    res.json(clubs);
+  } catch (error) {
+    console.error("Error fetching member clubs:", error);
+    res.status(500).json({ message: "Error fetching clubs" });
+  }
+});
+// Get Member's Events
+app.get("/member/events", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const { eventRegistrationsCollection } = await connectDB();
+    const events = await eventRegistrationsCollection
+      .aggregate([
+        { $match: { userEmail } },
+        {
+          $lookup: {
+            from: "eventsCollection",
+            localField: "eventId",
+            foreignField: "_id",
+            as: "event",
+          },
+        },
+        { $unwind: "$event" },
+        {
+          $lookup: {
+            from: "clubsCollection",
+            localField: "event.clubId",
+            foreignField: "_id",
+            as: "club",
+          },
+        },
+        { $unwind: "$club" },
+        {
+          $project: {
+            _id: "$event._id",
+            title: "$event.title",
+            description: "$event.description",
+            eventDate: "$event.eventDate",
+            location: "$event.location",
+            clubName: "$club.clubName",
+            status: "$status",
+            registeredAt: "$registeredAt",
+          },
+        },
+        { $sort: { eventDate: -1 } },
+      ])
+      .toArray();
+    res.json(events);
+  } catch (error) {
+    console.error("Error fetching member events:", error);
+    res.status(500).json({ message: "Error fetching events" });
+  }
+});
+// Create Checkout Session - Join Club
 app.post(
   "/clubs/:clubId/create-checkout-session",
   verifyFireBaseToken,
@@ -1130,7 +1383,6 @@ app.post(
         return res.status(400).send({ message: "Invalid club ID" });
       }
 
-      // Check if already a member (prevent duplicates before checkout)
       const existingMembership = await membershipsCollection.findOne({
         userEmail,
         clubId: new ObjectId(clubId),
@@ -1138,33 +1390,26 @@ app.post(
       });
 
       if (existingMembership) {
-        return res.status(400).send({
-          message: "Already an active member of this club",
-        });
+        return res
+          .status(400)
+          .send({ message: "Already an active member of this club" });
       }
 
-      // Get club details
       const club = await clubsCollection.findOne({
         _id: new ObjectId(clubId),
       });
-
-      if (!club) {
-        return res.status(404).send({ message: "Club not found" });
-      }
-
+      if (!club) return res.status(404).send({ message: "Club not found" });
       if (club.status !== "approved") {
         return res.status(400).send({
           message: "This club is not available for membership",
         });
       }
-
       if (!club.membershipFee || club.membershipFee === 0) {
-        return res.status(400).send({
-          message: "This club has free membership",
-        });
+        return res
+          .status(400)
+          .send({ message: "This club has free membership" });
       }
 
-      // Create Stripe checkout session
       const session = await stripe.checkout.sessions.create({
         payment_method_types: ["card"],
         line_items: [
@@ -1185,27 +1430,17 @@ app.post(
         customer_email: userEmail,
         success_url: `${clientUrl}/membership-success?clubId=${clubId}&sessionId={CHECKOUT_SESSION_ID}`,
         cancel_url: `${clientUrl}/clubs/${clubId}`,
-        metadata: {
-          clubId,
-          userEmail,
-          type: "join",
-        },
+        metadata: { clubId, userEmail, type: "join" },
       });
 
-      res.send({
-        url: session.url,
-        sessionId: session.id,
-      });
+      res.send({ url: session.url, sessionId: session.id });
     } catch (err) {
       console.error(err);
       res.status(500).send({ message: "Internal server error" });
     }
   }
 );
-
-// -------------------------------
-// CREATE CHECKOUT SESSION (RENEWAL)
-// -------------------------------
+// Create Checkout Session - Renew Membership
 app.post(
   "/clubs/:clubId/create-renewal-session",
   verifyFireBaseToken,
@@ -1222,15 +1457,11 @@ app.post(
       const club = await clubsCollection.findOne({
         _id: new ObjectId(clubId),
       });
-
-      if (!club) {
-        return res.status(404).send({ message: "Club not found" });
-      }
-
+      if (!club) return res.status(404).send({ message: "Club not found" });
       if (!club.membershipFee || club.membershipFee === 0) {
-        return res.status(400).send({
-          message: "This club has free membership",
-        });
+        return res
+          .status(400)
+          .send({ message: "This club has free membership" });
       }
 
       const membership = await membershipsCollection.findOne({
@@ -1242,7 +1473,6 @@ app.post(
         return res.status(404).send({ message: "Membership not found" });
       }
 
-      // Create Stripe checkout session
       const session = await stripe.checkout.sessions.create({
         payment_method_types: ["card"],
         line_items: [
@@ -1263,27 +1493,17 @@ app.post(
         customer_email: userEmail,
         success_url: `${clientUrl}/membership-success?clubId=${clubId}&sessionId={CHECKOUT_SESSION_ID}`,
         cancel_url: `${clientUrl}/clubs/${clubId}`,
-        metadata: {
-          clubId,
-          userEmail,
-          type: "renewal",
-        },
+        metadata: { clubId, userEmail, type: "renewal" },
       });
 
-      res.send({
-        url: session.url,
-        sessionId: session.id,
-      });
+      res.send({ url: session.url, sessionId: session.id });
     } catch (err) {
       console.error(err);
       res.status(500).send({ message: "Internal server error" });
     }
   }
 );
-
-// -------------------------------
-// VERIFY CHECKOUT SESSION & CREATE MEMBERSHIP
-// -------------------------------
+// Verify Checkout Session
 app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
   try {
     const { sessionId } = req.body;
@@ -1294,9 +1514,6 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
       return res.status(400).send({ message: "Session ID required" });
     }
 
-    console.log("Verifying session:", sessionId, "for user:", userEmail);
-
-    // Retrieve session from Stripe
     let session;
     try {
       session = await stripe.checkout.sessions.retrieve(sessionId);
@@ -1305,8 +1522,6 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
       return res.status(400).send({ message: "Invalid session ID" });
     }
 
-    console.log("Session status:", session.payment_status);
-
     if (session.payment_status !== "paid") {
       return res.status(400).send({
         message: `Payment not completed. Status: ${session.payment_status}`,
@@ -1314,70 +1529,67 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
     }
 
     const { clubId, type } = session.metadata;
-
     if (!clubId || !type) {
       return res.status(400).send({ message: "Invalid session metadata" });
     }
 
-    console.log("Processing", type, "for club:", clubId);
-
-    // ============ JOIN ============
     if (type === "join") {
+      const activeMembership = await membershipsCollection.findOne({
+        userEmail,
+        clubId: new ObjectId(clubId),
+        status: "active",
+      });
+
+      if (activeMembership) {
+        return res.send({
+          message: "Already an active member of this club",
+          alreadyMember: true,
+        });
+      }
+
+      const existingPayment = await membershipsCollection.findOne({
+        userEmail,
+        clubId: new ObjectId(clubId),
+        paymentId: sessionId,
+      });
+
+      if (existingPayment) {
+        return res.send({
+          message: "Membership already activated for this payment",
+          alreadyProcessed: true,
+        });
+      }
+
+      const club = await clubsCollection.findOne({
+        _id: new ObjectId(clubId),
+      });
+      if (!club) return res.status(404).send({ message: "Club not found" });
+
+      const newMembership = {
+        userEmail,
+        clubId: new ObjectId(clubId),
+        status: "active",
+        joinedAt: new Date(),
+        expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+        paymentId: sessionId,
+        amount: session.amount_total / 100,
+        createdAt: new Date(),
+      };
+
       try {
-        // Check if user already has active membership
-        const activeMembership = await membershipsCollection.findOne({
-          userEmail,
-          clubId: new ObjectId(clubId),
-          status: "active",
-        });
-
-        if (activeMembership) {
-          console.log("User already has active membership");
-          return res.send({
-            message: "Already an active member of this club",
-            membershipId: activeMembership._id,
-            alreadyMember: true,
-          });
-        }
-
-        // Check if this exact payment was already processed
-        const existingPayment = await membershipsCollection.findOne({
-          userEmail,
-          clubId: new ObjectId(clubId),
-          paymentId: sessionId,
-        });
-
-        if (existingPayment) {
-          console.log("Payment already processed");
-          return res.send({
-            message: "Membership already activated for this payment",
-            membershipId: existingPayment._id,
-            alreadyProcessed: true,
-          });
-        }
-
-        const club = await clubsCollection.findOne({
-          _id: new ObjectId(clubId),
-        });
-
-        if (!club) {
-          return res.status(404).send({ message: "Club not found" });
-        }
-
-        // Create new membership
-        const newMembership = {
-          userEmail,
-          clubId: new ObjectId(clubId),
-          status: "active",
-          joinedAt: new Date(),
-          expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000), // 1 year
-          paymentId: sessionId,
-          amount: session.amount_total / 100,
-          createdAt: new Date(),
-        };
-
         const result = await membershipsCollection.insertOne(newMembership);
-        console.log("Membership created:", result.insertedId);
+
+        await recordPayment({
+          transactionId: sessionId,
+          userEmail,
+          paymentType: "membership",
+          amount: session.amount_total / 100,
+          status: "completed",
+          relatedId: clubId,
+          relatedName: club.clubName,
+          description: `Membership payment for ${club.clubName}`,
+          stripeSessionId: sessionId,
+        });
 
         return res.send({
           message: "Membership activated successfully",
@@ -1385,11 +1597,7 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
           success: true,
         });
       } catch (dbError) {
-        console.error("Database error during join:", dbError);
-
-        // Handle duplicate key error (E11000)
         if (dbError.code === 11000) {
-          console.log("Duplicate key error, checking for existing membership");
           const existingMembership = await membershipsCollection.findOne({
             userEmail,
             clubId: new ObjectId(clubId),
@@ -1399,7 +1607,6 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
           if (existingMembership) {
             return res.send({
               message: "Membership already exists for this payment",
-              membershipId: existingMembership._id,
               alreadyProcessed: true,
             });
           }
@@ -1408,65 +1615,69 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
             message: "Membership already exists for this club",
           });
         }
-
         throw dbError;
       }
-    }
-    // ============ RENEWAL ============
-    else if (type === "renewal") {
-      try {
-        const membership = await membershipsCollection.findOne({
-          userEmail,
-          clubId: new ObjectId(clubId),
-        });
+    } else if (type === "renewal") {
+      const membership = await membershipsCollection.findOne({
+        userEmail,
+        clubId: new ObjectId(clubId),
+      });
 
-        if (!membership) {
-          return res.status(404).send({ message: "Membership not found" });
-        }
+      if (!membership) {
+        return res.status(404).send({ message: "Membership not found" });
+      }
 
-        // Check if this payment was already used for renewal
-        const alreadyRenewed = await membershipsCollection.findOne({
-          userEmail,
-          clubId: new ObjectId(clubId),
-          paymentId: sessionId,
-        });
+      const alreadyRenewed = await membershipsCollection.findOne({
+        userEmail,
+        clubId: new ObjectId(clubId),
+        paymentId: sessionId,
+      });
 
-        if (alreadyRenewed) {
-          console.log("Membership already renewed with this payment");
-          return res.send({
-            message: "Membership already renewed with this payment",
-            alreadyProcessed: true,
-          });
-        }
-
-        const updateResult = await membershipsCollection.updateOne(
-          { _id: membership._id },
-          {
-            $set: {
-              status: "active",
-              expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
-              paymentId: sessionId,
-              renewedAt: new Date(),
-            },
-          }
-        );
-
-        if (updateResult.modifiedCount === 0) {
-          return res.status(400).send({
-            message: "Failed to update membership",
-          });
-        }
-
-        console.log("Membership renewed successfully");
-
+      if (alreadyRenewed) {
         return res.send({
-          message: "Membership renewed successfully",
-          success: true,
+          message: "Membership already renewed with this payment",
+          alreadyProcessed: true,
         });
-      } catch (dbError) {
-        console.error("Database error during renewal:", dbError);
-        throw dbError;
       }
+
+      const club = await clubsCollection.findOne({
+        _id: new ObjectId(clubId),
+      });
+
+      const updateResult = await membershipsCollection.updateOne(
+        { _id: membership._id },
+        {
+          $set: {
+            status: "active",
+            expiresAt: new Date(Date.now() + 365 * 24 * 60 * 60 * 1000),
+            paymentId: sessionId,
+            renewedAt: new Date(),
+          },
+        }
+      );
+
+      if (updateResult.modifiedCount === 0) {
+        return res.status(400).send({ message: "Failed to update membership" });
+      }
+
+      await recordPayment({
+        transactionId: sessionId,
+        userEmail,
+        paymentType: "membership",
+        amount: session.amount_total / 100,
+        status: "completed",
+        relatedId: clubId,
+        relatedName: club?.clubName || "Unknown Club",
+        description: `Membership renewal for ${
+          club?.clubName || "Unknown Club"
+        }`,
+        stripeSessionId: sessionId,
+      });
+
+      return res.send({
+        message: "Membership renewed successfully",
+        success: true,
+      });
     } else {
       return res.status(400).send({ message: "Invalid transaction type" });
     }
@@ -1475,614 +1686,37 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
     res.status(500).send({ message: "Internal server error: " + err.message });
   }
 });
-
-// -------------------------------
-// GET USER'S ALL MEMBERSHIPS
-// -------------------------------
-app.get("/users/memberships", verifyFireBaseToken, async (req, res) => {
-  try {
-    const userEmail = req.token_email;
-    const { membershipsCollection, clubsCollection } = await connectDB();
-
-    // Find all memberships for the user
-    const memberships = await membershipsCollection
-      .find({ userEmail })
-      .toArray();
-
-    // Enrich with club details
-    const enrichedMemberships = await Promise.all(
-      memberships.map(async (membership) => {
-        const club = await clubsCollection.findOne({
-          _id: membership.clubId,
-        });
-
-        return {
-          ...membership,
-          clubName: club?.clubName || "Unknown Club",
-          clubCategory: club?.category || "N/A",
-          clubLocation: club?.location || "N/A",
-        };
-      })
-    );
-
-    res.send(enrichedMemberships);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// -------------------------------
-// GET ALL MEMBERSHIPS (ADMIN)
-// -------------------------------
+// Get user event registration for a specific event
 app.get(
-  "/admin/memberships",
-  verifyFireBaseToken,
-  verifyAdmin,
-  async (req, res) => {
-    try {
-      const { membershipsCollection, clubsCollection } = await connectDB();
-
-      // Get all memberships
-      const memberships = await membershipsCollection.find({}).toArray();
-
-      // Enrich with club and user details
-      const enrichedMemberships = await Promise.all(
-        memberships.map(async (membership) => {
-          const club = await clubsCollection.findOne({
-            _id: membership.clubId,
-          });
-
-          return {
-            ...membership,
-            clubName: club?.clubName || "Unknown Club",
-            clubCategory: club?.category || "N/A",
-          };
-        })
-      );
-
-      res.send(enrichedMemberships);
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// GET CLUB MEMBERS (CLUB MANAGER)
-// -------------------------------
-app.get(
-  "/clubs/:clubId/members",
-  verifyFireBaseToken,
-  verifyClubManager,
-  async (req, res) => {
-    try {
-      const { clubId } = req.params;
-      const { clubsCollection, membershipsCollection, usersCollection } =
-        await connectDB();
-
-      if (!ObjectId.isValid(clubId)) {
-        return res.status(400).send({ message: "Invalid club ID" });
-      }
-
-      // Verify club manager owns this club
-      const club = await clubsCollection.findOne({
-        _id: new ObjectId(clubId),
-      });
-
-      if (!club) {
-        return res.status(404).send({ message: "Club not found" });
-      }
-
-      // Check permissions
-      const user = await usersCollection.findOne({
-        email: req.token_email,
-      });
-
-      if (club.managerEmail !== req.token_email && user?.role !== "admin") {
-        return res
-          .status(403)
-          .send({ message: "Not authorized to view members" });
-      }
-
-      // Get all members of the club
-      const members = await membershipsCollection
-        .find({ clubId: new ObjectId(clubId) })
-        .toArray();
-
-      res.send(members);
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// CANCEL/REMOVE MEMBERSHIP (USER/ADMIN/MANAGER)
-// -------------------------------
-app.delete(
-  "/memberships/:membershipId",
-  verifyFireBaseToken,
-  async (req, res) => {
-    try {
-      const { membershipId } = req.params;
-      const userEmail = req.token_email;
-      const { membershipsCollection, clubsCollection, usersCollection } =
-        await connectDB();
-
-      if (!ObjectId.isValid(membershipId)) {
-        return res.status(400).send({ message: "Invalid membership ID" });
-      }
-
-      const membership = await membershipsCollection.findOne({
-        _id: new ObjectId(membershipId),
-      });
-
-      if (!membership) {
-        return res.status(404).send({ message: "Membership not found" });
-      }
-
-      // Get user and club info
-      const user = await usersCollection.findOne({ email: userEmail });
-      const club = await clubsCollection.findOne({ _id: membership.clubId });
-
-      // Authorization logic:
-      // 1. User can delete their own membership
-      // 2. Club manager can delete any membership in their club
-      // 3. Admin can delete any membership
-      const isOwnMembership = membership.userEmail === userEmail;
-      const isClubManager = club && club.managerEmail === userEmail;
-      const isAdmin = user && user.role === "admin";
-
-      if (!isOwnMembership && !isClubManager && !isAdmin) {
-        return res.status(403).send({
-          message: "Not authorized to remove this membership",
-        });
-      }
-
-      // Delete the membership
-      await membershipsCollection.deleteOne({
-        _id: new ObjectId(membershipId),
-      });
-
-      res.send({ message: "Membership removed successfully" });
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// CREATE EVENT (CLUB MANAGER)
-// -------------------------------
-app.post(
-  "/clubs/:clubId/events",
-  verifyFireBaseToken,
-  verifyClubManager,
-  async (req, res) => {
-    try {
-      const { clubId } = req.params;
-      const { clubsCollection, eventsCollection, usersCollection } =
-        await connectDB();
-
-      if (!ObjectId.isValid(clubId)) {
-        return res.status(400).send({ message: "Invalid club ID" });
-      }
-
-      // Verify manager owns this club
-      const club = await clubsCollection.findOne({
-        _id: new ObjectId(clubId),
-      });
-
-      if (!club) {
-        return res.status(404).send({ message: "Club not found" });
-      }
-
-      const user = await usersCollection.findOne({
-        email: req.token_email,
-      });
-
-      if (club.managerEmail !== req.token_email && user?.role !== "admin") {
-        return res
-          .status(403)
-          .send({ message: "Not authorized to create events for this club" });
-      }
-
-      const {
-        title,
-        description,
-        eventDate,
-        location,
-        isPaid,
-        eventFee,
-        maxAttendees,
-      } = req.body;
-
-      if (!title || !description || !eventDate || !location) {
-        return res.status(400).send({ message: "Missing required fields" });
-      }
-
-      const newEvent = {
-        clubId: new ObjectId(clubId),
-        title,
-        description,
-        eventDate: new Date(eventDate),
-        location,
-        isPaid: Boolean(isPaid),
-        eventFee: isPaid ? Number(eventFee) : 0,
-        maxAttendees: maxAttendees ? Number(maxAttendees) : null,
-        attendeeCount: 0,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      };
-
-      const result = await eventsCollection.insertOne(newEvent);
-
-      res.status(201).send({
-        message: "Event created successfully",
-        eventId: result.insertedId,
-        event: newEvent,
-      });
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// GET ALL EVENTS FOR A CLUB
-// -------------------------------
-app.get("/clubs/:clubId/events", async (req, res) => {
-  try {
-    const { clubId } = req.params;
-    const { eventsCollection, clubsCollection } = await connectDB();
-
-    if (!ObjectId.isValid(clubId)) {
-      return res.status(400).send({ message: "Invalid club ID" });
-    }
-
-    const club = await clubsCollection.findOne({
-      _id: new ObjectId(clubId),
-    });
-
-    if (!club) {
-      return res.status(404).send({ message: "Club not found" });
-    }
-
-    const events = await eventsCollection
-      .find({ clubId: new ObjectId(clubId) })
-      .sort({ eventDate: 1 })
-      .toArray();
-
-    res.send(events);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// -------------------------------
-// GET SINGLE EVENT
-// -------------------------------
-app.get("/events/:eventId", async (req, res) => {
-  try {
-    const { eventId } = req.params;
-    const { eventsCollection } = await connectDB();
-
-    if (!ObjectId.isValid(eventId)) {
-      return res.status(400).send({ message: "Invalid event ID" });
-    }
-
-    const event = await eventsCollection.findOne({
-      _id: new ObjectId(eventId),
-    });
-
-    if (!event) {
-      return res.status(404).send({ message: "Event not found" });
-    }
-
-    res.send(event);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// -------------------------------
-// UPDATE EVENT (CLUB MANAGER)
-// -------------------------------
-app.patch(
-  "/events/:eventId",
-  verifyFireBaseToken,
-  verifyClubManager,
-  async (req, res) => {
-    try {
-      const { eventId } = req.params;
-      const { eventsCollection, clubsCollection, usersCollection } =
-        await connectDB();
-
-      if (!ObjectId.isValid(eventId)) {
-        return res.status(400).send({ message: "Invalid event ID" });
-      }
-
-      const event = await eventsCollection.findOne({
-        _id: new ObjectId(eventId),
-      });
-
-      if (!event) {
-        return res.status(404).send({ message: "Event not found" });
-      }
-
-      const club = await clubsCollection.findOne({
-        _id: event.clubId,
-      });
-
-      const user = await usersCollection.findOne({
-        email: req.token_email,
-      });
-
-      if (club.managerEmail !== req.token_email && user?.role !== "admin") {
-        return res
-          .status(403)
-          .send({ message: "Not authorized to update this event" });
-      }
-
-      const {
-        title,
-        description,
-        eventDate,
-        location,
-        isPaid,
-        eventFee,
-        maxAttendees,
-      } = req.body;
-
-      const updateDoc = {
-        $set: {
-          title: title || event.title,
-          description: description || event.description,
-          eventDate: eventDate ? new Date(eventDate) : event.eventDate,
-          location: location || event.location,
-          isPaid: isPaid !== undefined ? Boolean(isPaid) : event.isPaid,
-          eventFee:
-            isPaid && eventFee ? Number(eventFee) : isPaid ? event.eventFee : 0,
-          maxAttendees: maxAttendees
-            ? Number(maxAttendees)
-            : event.maxAttendees,
-          updatedAt: new Date(),
-        },
-      };
-
-      await eventsCollection.updateOne(
-        { _id: new ObjectId(eventId) },
-        updateDoc
-      );
-
-      res.send({ message: "Event updated successfully" });
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// -------------------------------
-// DELETE EVENT (CLUB MANAGER)
-// -------------------------------
-app.delete(
-  "/events/:eventId",
-  verifyFireBaseToken,
-  verifyClubManager,
-  async (req, res) => {
-    try {
-      const { eventId } = req.params;
-      const { eventsCollection, clubsCollection, usersCollection } =
-        await connectDB();
-
-      if (!ObjectId.isValid(eventId)) {
-        return res.status(400).send({ message: "Invalid event ID" });
-      }
-
-      const event = await eventsCollection.findOne({
-        _id: new ObjectId(eventId),
-      });
-
-      if (!event) {
-        return res.status(404).send({ message: "Event not found" });
-      }
-
-      const club = await clubsCollection.findOne({
-        _id: event.clubId,
-      });
-
-      const user = await usersCollection.findOne({
-        email: req.token_email,
-      });
-
-      if (club.managerEmail !== req.token_email && user?.role !== "admin") {
-        return res
-          .status(403)
-          .send({ message: "Not authorized to delete this event" });
-      }
-
-      await eventsCollection.deleteOne({ _id: new ObjectId(eventId) });
-
-      res.send({ message: "Event deleted successfully" });
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// =============================== EVENT REGISTRATION ROUTES ===============================
-
-// REGISTER FOR EVENT (CREATE PAYMENT INTENT OR REGISTER DIRECTLY)
-app.post("/events/:eventId/register", verifyFireBaseToken, async (req, res) => {
-  try {
-    const { eventId } = req.params;
-    const userEmail = req.token_email;
-    const { eventsCollection, eventRegistrationsCollection } =
-      await connectDB();
-
-    if (!ObjectId.isValid(eventId)) {
-      return res.status(400).send({ message: "Invalid event ID" });
-    }
-
-    // Check if event exists
-    const event = await eventsCollection.findOne({
-      _id: new ObjectId(eventId),
-    });
-
-    if (!event) {
-      return res.status(404).send({ message: "Event not found" });
-    }
-
-    // Check if already registered
-    const existingRegistration = await eventRegistrationsCollection.findOne({
-      eventId: new ObjectId(eventId),
-      userEmail,
-    });
-
-    if (existingRegistration) {
-      return res.status(400).send({
-        message: "Already registered for this event",
-      });
-    }
-
-    // Check attendee limit
-    if (event.maxAttendees && event.attendeeCount >= event.maxAttendees) {
-      return res.status(400).send({ message: "Event is full" });
-    }
-
-    // If free event, register directly
-    if (!event.isPaid || event.eventFee === 0) {
-      const registration = {
-        eventId: new ObjectId(eventId),
-        userEmail,
-        clubId: event.clubId,
-        status: "registered",
-        registeredAt: new Date(),
-        paymentId: null,
-      };
-
-      const result = await eventRegistrationsCollection.insertOne(registration);
-
-      // Update attendee count
-      await eventsCollection.updateOne(
-        { _id: new ObjectId(eventId) },
-        { $inc: { attendeeCount: 1 } }
-      );
-
-      return res.send({
-        message: "Registered successfully",
-        registrationId: result.insertedId,
-      });
-    }
-
-    // Create Stripe payment intent for paid event
-    const paymentIntent = await stripe.paymentIntents.create({
-      amount: Math.round(event.eventFee * 100),
-      currency: "usd",
-      metadata: {
-        eventId,
-        userEmail,
-        clubId: event.clubId.toString(),
-        type: "eventRegistration",
-      },
-    });
-
-    res.send({
-      clientSecret: paymentIntent.client_secret,
-      amount: event.eventFee,
-      eventTitle: event.title,
-      message: "Payment intent created",
-    });
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Internal server error" });
-  }
-});
-
-// CREATE CHECKOUT SESSION FOR EVENT REGISTRATION
-app.post(
-  "/events/:eventId/create-registration-session",
+  "/users/event-registrations/:eventId",
   verifyFireBaseToken,
   async (req, res) => {
     try {
       const { eventId } = req.params;
       const userEmail = req.token_email;
-      const { eventsCollection, eventRegistrationsCollection } =
-        await connectDB();
+      const { eventRegistrationsCollection } = await connectDB();
 
       if (!ObjectId.isValid(eventId)) {
         return res.status(400).send({ message: "Invalid event ID" });
       }
 
-      const event = await eventsCollection.findOne({
-        _id: new ObjectId(eventId),
-      });
-
-      if (!event) {
-        return res.status(404).send({ message: "Event not found" });
-      }
-
-      // Check if already registered
-      const existingRegistration = await eventRegistrationsCollection.findOne({
+      const registration = await eventRegistrationsCollection.findOne({
         eventId: new ObjectId(eventId),
         userEmail,
       });
 
-      if (existingRegistration) {
-        return res.status(400).send({
-          message: "Already registered for this event",
-        });
+      if (!registration) {
+        return res.send({ isRegistered: false, registration: null });
       }
-
-      // Check attendee limit
-      if (event.maxAttendees && event.attendeeCount >= event.maxAttendees) {
-        return res.status(400).send({ message: "Event is full" });
-      }
-
-      if (!event.isPaid || event.eventFee === 0) {
-        return res.status(400).send({
-          message: "This is a free event",
-        });
-      }
-
-      const session = await stripe.checkout.sessions.create({
-        payment_method_types: ["card"],
-        line_items: [
-          {
-            price_data: {
-              currency: "usd",
-              product_data: {
-                name: `${event.title} - Registration`,
-                description: `Register for ${event.title}`,
-              },
-              unit_amount: Math.round(event.eventFee * 100),
-            },
-            quantity: 1,
-          },
-        ],
-        mode: "payment",
-        customer_email: userEmail,
-        success_url: `${clientUrl}/event-registration-success?eventId=${eventId}&sessionId={CHECKOUT_SESSION_ID}`,
-        cancel_url: `${clientUrl}/events/${eventId}`,
-        metadata: {
-          eventId,
-          userEmail,
-          type: "eventRegistration",
-        },
-      });
 
       res.send({
-        url: session.url,
-        sessionId: session.id,
+        isRegistered: true,
+        registration: {
+          _id: registration._id,
+          status: registration.status,
+          registeredAt: registration.registeredAt,
+          paymentId: registration.paymentId,
+        },
       });
     } catch (err) {
       console.error(err);
@@ -2090,193 +1724,64 @@ app.post(
     }
   }
 );
-
-// VERIFY EVENT REGISTRATION SESSION & CREATE REGISTRATION
-app.post(
-  "/events/verify-registration-session",
-  verifyFireBaseToken,
-  async (req, res) => {
-    try {
-      const { sessionId } = req.body;
-      const userEmail = req.token_email;
-      const { eventsCollection, eventRegistrationsCollection } =
-        await connectDB();
-
-      if (!sessionId) {
-        return res.status(400).send({ message: "Session ID required" });
-      }
-
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
-
-      if (session.payment_status !== "paid") {
-        return res.status(400).send({ message: "Payment not completed" });
-      }
-
-      const { eventId } = session.metadata;
-
-      // Check if already registered
-      const existingRegistration = await eventRegistrationsCollection.findOne({
-        eventId: new ObjectId(eventId),
-        userEmail,
-      });
-
-      if (existingRegistration) {
-        return res.send({
-          message: "Already registered for this event",
-          registrationId: existingRegistration._id,
-          alreadyRegistered: true,
-        });
-      }
-
-      const event = await eventsCollection.findOne({
-        _id: new ObjectId(eventId),
-      });
-
-      if (!event) {
-        return res.status(404).send({ message: "Event not found" });
-      }
-
-      // Check attendee limit
-      if (event.maxAttendees && event.attendeeCount >= event.maxAttendees) {
-        return res.status(400).send({ message: "Event is full" });
-      }
-
-      try {
-        const registration = {
-          eventId: new ObjectId(eventId),
-          userEmail,
-          clubId: event.clubId,
-          status: "registered",
-          registeredAt: new Date(),
-          paymentId: sessionId,
-          amount: session.amount_total / 100,
-        };
-
-        const result = await eventRegistrationsCollection.insertOne(
-          registration
-        );
-
-        // Update attendee count
-        await eventsCollection.updateOne(
-          { _id: new ObjectId(eventId) },
-          { $inc: { attendeeCount: 1 } }
-        );
-
-        return res.send({
-          message: "Registration successful",
-          registrationId: result.insertedId,
-          success: true,
-        });
-      } catch (dbError) {
-        if (dbError.code === 11000) {
-          const existingReg = await eventRegistrationsCollection.findOne({
-            eventId: new ObjectId(eventId),
-            userEmail,
-          });
-
-          return res.send({
-            message: "Registration already exists for this payment",
-            registrationId: existingReg._id,
-            alreadyRegistered: true,
-          });
-        }
-        throw dbError;
-      }
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
-    }
-  }
-);
-
-// GET USER'S EVENT REGISTRATIONS
+// Get all user event registrations
 app.get("/users/event-registrations", verifyFireBaseToken, async (req, res) => {
   try {
     const userEmail = req.token_email;
-    const { eventRegistrationsCollection, eventsCollection } =
-      await connectDB();
+    const { eventRegistrationsCollection } = await connectDB();
 
     const registrations = await eventRegistrationsCollection
       .find({ userEmail })
       .toArray();
 
-    // Enrich with event details
-    const enrichedRegistrations = await Promise.all(
-      registrations.map(async (reg) => {
-        const event = await eventsCollection.findOne({
-          _id: reg.eventId,
-        });
-
-        return {
-          ...reg,
-          eventTitle: event?.title || "Unknown Event",
-          eventDate: event?.eventDate,
-          eventLocation: event?.location,
-        };
-      })
-    );
-
-    res.send(enrichedRegistrations);
+    res.send(registrations);
   } catch (err) {
     console.error(err);
     res.status(500).send({ message: "Internal server error" });
   }
 });
+// Get all user memberships
+app.get("/users/memberships", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const { membershipsCollection } = await connectDB();
 
-// GET EVENT REGISTRATIONS FOR SPECIFIC EVENT
-app.get(
-  "/events/:eventId/registrations",
-  verifyFireBaseToken,
-  verifyClubManager,
-  async (req, res) => {
-    try {
-      const { eventId } = req.params;
-      const {
-        eventRegistrationsCollection,
-        eventsCollection,
-        usersCollection,
-      } = await connectDB();
+    const memberships = await membershipsCollection
+      .aggregate([
+        { $match: { userEmail } },
+        {
+          $lookup: {
+            from: "clubsCollection",
+            localField: "clubId",
+            foreignField: "_id",
+            as: "club",
+          },
+        },
+        { $unwind: "$club" },
+        {
+          $project: {
+            _id: 1,
+            clubId: 1,
+            clubName: "$club.clubName",
+            clubCategory: "$club.category",
+            clubLocation: "$club.location",
+            status: 1,
+            joinedAt: 1,
+            expiresAt: 1,
+            amount: 1,
+            userEmail: 1,
+          },
+        },
+      ])
+      .toArray();
 
-      if (!ObjectId.isValid(eventId)) {
-        return res.status(400).send({ message: "Invalid event ID" });
-      }
-
-      const event = await eventsCollection.findOne({
-        _id: new ObjectId(eventId),
-      });
-
-      if (!event) {
-        return res.status(404).send({ message: "Event not found" });
-      }
-
-      // Check permissions
-      const user = await usersCollection.findOne({
-        email: req.token_email,
-      });
-
-      const club = await clubsCollection.findOne({
-        _id: event.clubId,
-      });
-
-      if (club.managerEmail !== req.token_email && user?.role !== "admin") {
-        return res.status(403).send({
-          message: "Not authorized to view registrations",
-        });
-      }
-
-      const registrations = await eventRegistrationsCollection
-        .find({ eventId: new ObjectId(eventId) })
-        .toArray();
-
-      res.send(registrations);
-    } catch (err) {
-      console.error(err);
-      res.status(500).send({ message: "Internal server error" });
-    }
+    res.send(memberships);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Internal server error" });
   }
-);
-
-// CANCEL EVENT REGISTRATION
+});
+// Cancel Event Registration
 app.delete(
   "/event-registrations/:registrationId",
   verifyFireBaseToken,
@@ -2299,17 +1804,9 @@ app.delete(
         return res.status(404).send({ message: "Registration not found" });
       }
 
-      // Only the registered user or admin can cancel
+      // Verify ownership
       if (registration.userEmail !== userEmail) {
-        const user = await eventsCollection
-          .aggregate([{ $match: { _id: registration.eventId } }])
-          .toArray();
-
-        if (user[0]?.managerEmail !== userEmail) {
-          return res.status(403).send({
-            message: "Not authorized to cancel this registration",
-          });
-        }
+        return res.status(403).send({ message: "Not authorized" });
       }
 
       // Delete registration
@@ -2330,201 +1827,345 @@ app.delete(
     }
   }
 );
+// Get Member's Payments
+app.get("/member/payments", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const { paymentsCollection } = await connectDB();
 
-// =============================== NEW ROUTE ===============================
-// GET ALL EVENTS FOR A MANAGER (across all clubs)
-// ===============================
+    // Get all payments for this user
+    const payments = await paymentsCollection
+      .find({
+        userEmail,
+        status: "completed",
+      })
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    // Separate payments by type
+    const membershipPayments = payments.filter(
+      (p) => p.paymentType === "membership"
+    );
+    const eventPayments = payments.filter((p) => p.paymentType === "event");
+
+    res.json({
+      membershipPayments,
+      eventPayments,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: error.message });
+  }
+});
+// Get payments for a user
+// app.get("/payments/user/:email", verifyFireBaseToken, async (req, res) => {
+//   try {
+//     const { paymentsCollection, usersCollection } = await connectDB();
+//     const email = req.params.email;
+//     const user = await usersCollection.findOne({ email: req.token_email });
+//     if (req.token_email !== email && user?.role !== "admin") {
+//       return res.status(403).json({ message: "Unauthorized" });
+//     }
+//     const payments = await paymentsCollection
+//       .find({ userEmail: email })
+//       .sort({ createdAt: -1 })
+//       .toArray();
+//     res.json(payments);
+//   } catch (error) {
+//     console.error(error);
+//     res.status(500).json({ message: error.message });
+//   }
+// });
+
+/*===== Club Manager Routes =====*/
+// Get club(s) by ID or manager email
 app.get(
-  "/manager/events",
+  "/clubs/:param",
   verifyFireBaseToken,
   verifyClubManager,
   async (req, res) => {
     try {
-      const { eventsCollection, clubsCollection } = await connectDB();
-      const managerEmail = req.token_email;
-
-      // Find all clubs managed by this user
-      const managedClubs = await clubsCollection
-        .find({ managerEmail })
-        .toArray();
-
-      if (managedClubs.length === 0) {
-        return res.send([]);
+      const { clubsCollection } = await connectDB();
+      const param = req.params.param;
+      if (ObjectId.isValid(param)) {
+        const club = await clubsCollection.findOne({
+          _id: new ObjectId(param),
+        });
+        if (!club) return res.status(404).send({ message: "Club not found" });
+        const { authorized } = await verifyClubOwnership(
+          param,
+          req.token_email
+        );
+        if (!authorized)
+          return res.status(403).send({ message: "Not authorized" });
+        return res.send(club);
       }
-
-      // Get all events for these clubs
-      const clubIds = managedClubs.map((club) => club._id);
-      const events = await eventsCollection
-        .find({ clubId: { $in: clubIds } })
-        .sort({ eventDate: -1 })
+      // Fetch by manager email
+      if (param !== req.token_email)
+        return res.status(403).send({ message: "Not authorized" });
+      const clubs = await clubsCollection
+        .find({ managerEmail: param })
         .toArray();
-
-      // Enrich events with club data
-      const enrichedEvents = events.map((event) => {
-        const club = managedClubs.find((c) => c._id.equals(event.clubId));
-        return {
-          ...event,
-          clubData: club,
-        };
-      });
-
-      res.send(enrichedEvents);
+      res.send(clubs);
     } catch (err) {
       console.error(err);
       res.status(500).send({ message: "Internal server error" });
     }
   }
 );
-
-// -------------------------------
-// ADMIN STATS
-// -------------------------------
-app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
+// Create a new club
+app.post("/clubs", verifyFireBaseToken, verifyClubManager, async (req, res) => {
   try {
-    const { usersCollection, clubsCollection, membershipsCollection } =
-      await connectDB();
-
-    const totalUsers = await usersCollection.countDocuments();
-    const totalClubs = await clubsCollection.countDocuments();
-    const totalRevenue = await membershipsCollection
-      .aggregate([{ $group: { _id: null, total: { $sum: "$amount" } } }])
-      .toArray();
-
-    // User growth (last 6 months)
-    const sixMonthsAgo = new Date();
-    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-
-    const userGrowth = await usersCollection
-      .aggregate([
-        {
-          $group: {
-            _id: {
-              year: { $year: { $toDate: "$_id" } },
-              month: { $month: { $toDate: "$_id" } },
-            },
-            users: { $sum: 1 },
-          },
-        },
-        { $sort: { "_id.year": 1, "_id.month": 1 } },
-        {
-          $project: {
-            name: {
-              $dateToString: {
-                format: "%Y-%m",
-                date: {
-                  $toDate: {
-                    $dateFromParts: {
-                      year: "$_id.year",
-                      month: "$_id.month",
-                      day: 1,
-                    },
-                  },
-                },
-              },
-            },
-            users: 1,
-            _id: 0,
-          },
-        },
-      ])
-      .toArray();
-
-    // Clubs by category
-    const clubsByCategory = await clubsCollection
-      .aggregate([
-        { $group: { _id: "$category", value: { $sum: 1 } } },
-        { $project: { name: "$_id", value: 1, _id: 0 } },
-      ])
-      .toArray();
-
-    // Revenue by month (last 6 months)
-    const revenueByMonth = await membershipsCollection
-      .aggregate([
-        {
-          $group: {
-            _id: {
-              year: { $year: "$createdAt" },
-              month: { $month: "$createdAt" },
-            },
-            revenue: { $sum: "$amount" },
-          },
-        },
-        { $sort: { "_id.year": 1, "_id.month": 1 } },
-        {
-          $project: {
-            name: {
-              $dateToString: {
-                format: "%b",
-                date: {
-                  $toDate: {
-                    $dateFromParts: {
-                      year: "$_id.year",
-                      month: "$_id.month",
-                      day: 1,
-                    },
-                  },
-                },
-              },
-            },
-            revenue: 1,
-            _id: 0,
-          },
-        },
-      ])
-      .toArray();
-
-    // Membership status distribution
-    const membershipDistribution = await membershipsCollection
-      .aggregate([
-        { $group: { _id: "$status", value: { $sum: 1 } } },
-        { $project: { name: "$_id", value: 1, _id: 0 } },
-      ])
-      .toArray();
-
-    // Calculate trends
-    const thisMonth = new Date();
-    thisMonth.setDate(1);
-    const lastMonth = new Date(thisMonth);
-    lastMonth.setMonth(lastMonth.getMonth() - 1);
-
-    const thisMonthUsers = await usersCollection.countDocuments({
-      createdAt: { $gte: thisMonth },
+    const { clubsCollection } = await connectDB();
+    const managerEmail = req.token_email;
+    const {
+      clubName,
+      description,
+      category,
+      location,
+      bannerImage,
+      membershipFee,
+    } = req.body;
+    // Validate required fields
+    if (!clubName || !description || !category || !location || !bannerImage) {
+      return res
+        .status(400)
+        .send({ message: "All required fields must be provided" });
+    }
+    const newClub = {
+      clubName,
+      description,
+      category,
+      location,
+      bannerImage,
+      membershipFee: Number(membershipFee) || 0,
+      managerEmail,
+      status: "pending", // new clubs must be approved
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    const result = await clubsCollection.insertOne(newClub);
+    res.status(201).send({
+      message: "Club submitted successfully",
+      id: result.insertedId,
+      club: newClub,
     });
-    const lastMonthUsers = await usersCollection.countDocuments({
-      createdAt: {
-        $gte: lastMonth,
-        $lt: thisMonth,
-      },
-    });
-
-    const usersTrend =
-      lastMonthUsers > 0
-        ? Math.round(((thisMonthUsers - lastMonthUsers) / lastMonthUsers) * 100)
-        : 0;
-
-    res.json({
-      totalUsers,
-      totalClubs,
-      totalRevenue: totalRevenue[0]?.total || 0,
-      userGrowth,
-      clubsByCategory,
-      revenueByMonth,
-      membershipDistribution,
-      usersTrend,
-      clubsTrend: 5,
-      revenueTrend: 12,
-    });
-  } catch (error) {
-    console.error("Error fetching admin stats:", error);
-    res.status(500).json({ message: "Error fetching stats" });
+  } catch (e) {
+    console.error(e);
+    res.status(500).send({ message: "Internal server error" });
   }
 });
-
-// -------------------------------
-// CLUB MANAGER STATS
-// -------------------------------
+// Update a club
+app.patch(
+  "/clubs/:id",
+  verifyFireBaseToken,
+  verifyClubManager,
+  async (req, res) => {
+    try {
+      const { clubsCollection } = await connectDB();
+      const id = req.params.id;
+      const { authorized } = await verifyClubOwnership(id, req.token_email);
+      if (!authorized)
+        return res.status(403).send({ message: "Not authorized" });
+      const {
+        clubName,
+        description,
+        category,
+        location,
+        membershipFee,
+        bannerImage,
+      } = req.body;
+      const updateDoc = {
+        $set: {
+          clubName,
+          description,
+          category,
+          location,
+          membershipFee: Number(membershipFee),
+          bannerImage,
+          updatedAt: new Date(),
+        },
+      };
+      await clubsCollection.updateOne({ _id: new ObjectId(id) }, updateDoc);
+      res.send({ message: "Club updated successfully" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// Delete a club
+app.delete(
+  "/clubs/:id",
+  verifyFireBaseToken,
+  verifyClubManager,
+  async (req, res) => {
+    try {
+      const { clubsCollection } = await connectDB();
+      const id = req.params.id;
+      const { authorized } = await verifyClubOwnership(id, req.token_email);
+      if (!authorized)
+        return res.status(403).send({ message: "Not authorized" });
+      await clubsCollection.deleteOne({ _id: new ObjectId(id) });
+      res.send({ message: "Club deleted successfully" });
+    } catch (e) {
+      console.error(e);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// Create Event
+app.post(
+  "/clubs/:clubId/events",
+  verifyFireBaseToken,
+  verifyClubManager,
+  async (req, res) => {
+    try {
+      const { clubId } = req.params;
+      const { clubsCollection, eventsCollection } = await connectDB();
+      if (!ObjectId.isValid(clubId))
+        return res.status(400).send({ message: "Invalid club ID" });
+      const { authorized } = await verifyClubOwnership(clubId, req.token_email);
+      if (!authorized)
+        return res.status(403).send({ message: "Not authorized" });
+      const {
+        title,
+        description,
+        eventDate,
+        location,
+        isPaid,
+        eventFee,
+        maxAttendees,
+      } = req.body;
+      if (!title || !description || !eventDate || !location) {
+        return res.status(400).send({ message: "Missing required fields" });
+      }
+      const newEvent = {
+        clubId: new ObjectId(clubId),
+        title,
+        description,
+        eventDate: new Date(eventDate),
+        location,
+        isPaid: Boolean(isPaid),
+        eventFee: isPaid ? Number(eventFee) : 0,
+        maxAttendees: maxAttendees ? Number(maxAttendees) : null,
+        attendeeCount: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      const result = await eventsCollection.insertOne(newEvent);
+      res.status(201).send({
+        message: "Event created successfully",
+        eventId: result.insertedId,
+      });
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// Update an Event
+app.patch(
+  "/events/:eventId",
+  verifyFireBaseToken,
+  verifyClubManager,
+  async (req, res) => {
+    try {
+      const { eventId } = req.params;
+      const { authorized } = await verifyEventOwnership(
+        eventId,
+        req.token_email
+      );
+      if (!authorized)
+        return res.status(403).send({ message: "Not authorized" });
+      const { eventsCollection } = await connectDB();
+      const {
+        title,
+        description,
+        eventDate,
+        location,
+        isPaid,
+        eventFee,
+        maxAttendees,
+      } = req.body;
+      const updateDoc = {
+        $set: {
+          ...(title && { title }),
+          ...(description && { description }),
+          ...(eventDate && { eventDate: new Date(eventDate) }),
+          ...(location && { location }),
+          ...(isPaid !== undefined && { isPaid: Boolean(isPaid) }),
+          ...(isPaid && eventFee && { eventFee: Number(eventFee) }),
+          ...(maxAttendees && { maxAttendees: Number(maxAttendees) }),
+          updatedAt: new Date(),
+        },
+      };
+      await eventsCollection.updateOne(
+        { _id: new ObjectId(eventId) },
+        updateDoc
+      );
+      res.send({ message: "Event updated successfully" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// Delete Event
+app.delete(
+  "/events/:eventId",
+  verifyFireBaseToken,
+  verifyClubManager,
+  async (req, res) => {
+    try {
+      const { eventId } = req.params;
+      const { authorized } = await verifyEventOwnership(
+        eventId,
+        req.token_email
+      );
+      if (!authorized)
+        return res.status(403).send({ message: "Not authorized" });
+      const { eventsCollection } = await connectDB();
+      await eventsCollection.deleteOne({ _id: new ObjectId(eventId) });
+      res.send({ message: "Event deleted successfully" });
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// // Manager's Events
+// app.get(
+//   "/manager/events",
+//   verifyFireBaseToken,
+//   verifyClubManager,
+//   async (req, res) => {
+//     try {
+//       const { eventsCollection, clubsCollection } = await connectDB();
+//       const managerEmail = req.token_email;
+//       const managedClubs = await clubsCollection
+//         .find({ managerEmail })
+//         .toArray();
+//       if (managedClubs.length === 0) return res.send([]);
+//       const clubIds = managedClubs.map((club) => club._id);
+//       const events = await eventsCollection
+//         .find({ clubId: { $in: clubIds } })
+//         .sort({ eventDate: -1 })
+//         .toArray();
+//       const enrichedEvents = events.map((event) => {
+//         const club = managedClubs.find((c) => c._id.equals(event.clubId));
+//         return { ...event, clubData: club };
+//       });
+//       res.send(enrichedEvents);
+//     } catch (err) {
+//       console.error(err);
+//       res.status(500).send({ message: "Internal server error" });
+//     }
+//   }
+// );
+// Club Manager Stats
 app.get(
-  "/club-manager/stats",
+  "/club-manager/statistics",
   verifyFireBaseToken,
   verifyClubManager,
   async (req, res) => {
@@ -2535,13 +2176,11 @@ app.get(
         membershipsCollection,
         eventsCollection,
         eventRegistrationsCollection,
+        paymentsCollection,
       } = await connectDB();
-
-      // Get all clubs managed by this user
       const managedClubs = await clubsCollection
         .find({ managerEmail })
         .toArray();
-
       if (managedClubs.length === 0) {
         return res.json({
           totalMembers: 0,
@@ -2554,39 +2193,28 @@ app.get(
           membershipStatus: [],
           revenueByClub: [],
           eventStatus: [],
-          membersTrend: 0,
-          clubsTrend: 0,
-          eventsTrend: 0,
-          revenueTrend: 0,
         });
       }
-
       const clubIds = managedClubs.map((club) => club._id);
-
-      // Total members across all clubs
       const totalMembers = await membershipsCollection.countDocuments({
         clubId: { $in: clubIds },
         status: "active",
       });
-
-      const totalClubs = managedClubs.length;
-
-      // Total events
       const totalEvents = await eventsCollection.countDocuments({
         clubId: { $in: clubIds },
       });
-
-      // Total revenue
-      const totalRevenueResult = await membershipsCollection
+      const totalRevenue = await paymentsCollection
         .aggregate([
-          { $match: { clubId: { $in: clubIds } } },
+          {
+            $match: {
+              relatedId: { $in: clubIds.map((id) => id.toString()) },
+              status: "completed",
+            },
+          },
           { $group: { _id: null, total: { $sum: "$amount" } } },
         ])
         .toArray();
-
-      const totalRevenue = totalRevenueResult[0]?.total || 0;
-
-      // Membership growth (last 6 months)
+      // Membership growth
       const membershipGrowth = await membershipsCollection
         .aggregate([
           { $match: { clubId: { $in: clubIds } } },
@@ -2622,7 +2250,6 @@ app.get(
           },
         ])
         .toArray();
-
       // Members distribution by club
       const clubsDistribution = await membershipsCollection
         .aggregate([
@@ -2636,31 +2263,19 @@ app.get(
             },
           },
           { $unwind: "$club" },
-          {
-            $group: {
-              _id: "$club.clubName",
-              value: { $sum: 1 },
-            },
-          },
+          { $group: { _id: "$club.clubName", value: { $sum: 1 } } },
           { $project: { name: "$_id", value: 1, _id: 0 } },
         ])
         .toArray();
-
-      // Event attendance
+      // Top events by attendance
       const eventAttendance = await eventsCollection
         .aggregate([
           { $match: { clubId: { $in: clubIds } } },
-          {
-            $project: {
-              name: "$title",
-              attendance: "$attendeeCount",
-            },
-          },
+          { $project: { name: "$title", attendance: "$attendeeCount" } },
           { $sort: { attendance: -1 } },
           { $limit: 10 },
         ])
         .toArray();
-
       // Membership status
       const membershipStatus = await membershipsCollection
         .aggregate([
@@ -2669,7 +2284,6 @@ app.get(
           { $project: { name: "$_id", value: 1, _id: 0 } },
         ])
         .toArray();
-
       // Revenue by club
       const revenueByClub = await membershipsCollection
         .aggregate([
@@ -2683,12 +2297,7 @@ app.get(
             },
           },
           { $unwind: "$club" },
-          {
-            $group: {
-              _id: "$club.clubName",
-              revenue: { $sum: "$amount" },
-            },
-          },
+          { $group: { _id: "$club.clubName", revenue: { $sum: "$amount" } } },
           {
             $project: {
               name: "$_id",
@@ -2699,8 +2308,7 @@ app.get(
           { $sort: { revenue: -1 } },
         ])
         .toArray();
-
-      // Event status distribution
+      // Event status
       const eventStatus = await eventsCollection
         .aggregate([
           { $match: { clubId: { $in: clubIds } } },
@@ -2719,70 +2327,17 @@ app.get(
           { $project: { name: "$_id", value: 1, _id: 0 } },
         ])
         .toArray();
-
-      // Calculate trends (this month vs last month)
-      const thisMonth = new Date();
-      thisMonth.setDate(1);
-      thisMonth.setHours(0, 0, 0, 0);
-
-      const lastMonth = new Date(thisMonth);
-      lastMonth.setMonth(lastMonth.getMonth() - 1);
-
-      const thisMonthMembers = await membershipsCollection.countDocuments({
-        clubId: { $in: clubIds },
-        joinedAt: { $gte: thisMonth },
-      });
-
-      const lastMonthMembers = await membershipsCollection.countDocuments({
-        clubId: { $in: clubIds },
-        joinedAt: {
-          $gte: lastMonth,
-          $lt: thisMonth,
-        },
-      });
-
-      const membersTrend =
-        lastMonthMembers > 0
-          ? Math.round(
-              ((thisMonthMembers - lastMonthMembers) / lastMonthMembers) * 100
-            )
-          : 0;
-
-      const thisMonthEvents = await eventsCollection.countDocuments({
-        clubId: { $in: clubIds },
-        createdAt: { $gte: thisMonth },
-      });
-
-      const lastMonthEvents = await eventsCollection.countDocuments({
-        clubId: { $in: clubIds },
-        createdAt: {
-          $gte: lastMonth,
-          $lt: thisMonth,
-        },
-      });
-
-      const eventsTrend =
-        lastMonthEvents > 0
-          ? Math.round(
-              ((thisMonthEvents - lastMonthEvents) / lastMonthEvents) * 100
-            )
-          : 0;
-
       res.json({
         totalMembers,
-        totalClubs,
+        totalClubs: managedClubs.length,
         totalEvents,
-        totalRevenue: Math.round(totalRevenue * 100) / 100,
+        totalRevenue: totalRevenue[0]?.total || 0,
         membershipGrowth,
         clubsDistribution,
         eventAttendance,
         membershipStatus,
         revenueByClub,
         eventStatus,
-        membersTrend,
-        clubsTrend: 2,
-        eventsTrend,
-        revenueTrend: 8,
       });
     } catch (error) {
       console.error("Error fetching club manager stats:", error);
@@ -2790,201 +2345,792 @@ app.get(
     }
   }
 );
+// Get manager payments
+app.get(
+  "/manager/payments",
+  verifyFireBaseToken,
+  verifyClubManager,
+  async (req, res) => {
+    try {
+      const managerEmail = req.token_email;
+      const { clubsCollection, paymentsCollection } = await connectDB();
 
-// -------------------------------
-// MEMBER STATS
-// -------------------------------
-app.get("/member/stats", verifyFireBaseToken, async (req, res) => {
+      // Get all clubs managed by this manager
+      const managedClubs = await clubsCollection
+        .find({ managerEmail })
+        .toArray();
+
+      if (managedClubs.length === 0) {
+        return res.json({
+          membershipPayments: [],
+          eventPayments: [],
+        });
+      }
+
+      const clubIds = managedClubs.map((club) => club._id.toString());
+
+      // Get all payments related to these clubs
+      const payments = await paymentsCollection
+        .find({
+          relatedId: { $in: clubIds },
+          status: "completed",
+        })
+        .sort({ createdAt: -1 })
+        .toArray();
+
+      // Separate payments by type
+      const membershipPayments = payments.filter(
+        (p) => p.paymentType === "membership"
+      );
+      const eventPayments = payments.filter((p) => p.paymentType === "event");
+
+      res.json({
+        membershipPayments,
+        eventPayments,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: error.message });
+    }
+  }
+);
+// Get manager payment statistics
+app.get(
+  "/manager/payments/statistics",
+  verifyFireBaseToken,
+  verifyClubManager,
+  async (req, res) => {
+    try {
+      const managerEmail = req.token_email;
+      const { clubsCollection, paymentsCollection } = await connectDB();
+
+      // Get all clubs managed by this manager
+      const managedClubs = await clubsCollection
+        .find({ managerEmail })
+        .toArray();
+
+      if (managedClubs.length === 0) {
+        return res.json({
+          totalRevenue: 0,
+          membershipRevenue: 0,
+          eventRevenue: 0,
+          totalTransactions: 0,
+          revenueByType: [],
+          monthlyRevenue: [],
+        });
+      }
+
+      const clubIds = managedClubs.map((club) => club._id.toString());
+
+      // Overall statistics
+      const totalStats = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "completed",
+              relatedId: { $in: clubIds },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              totalRevenue: { $sum: "$amount" },
+              totalTransactions: { $sum: 1 },
+              totalNetAmount: { $sum: "$netAmount" },
+              totalPlatformFees: { $sum: "$stripePlatformFee" },
+            },
+          },
+        ])
+        .toArray();
+
+      // Revenue by type
+      const revenueByType = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "completed",
+              relatedId: { $in: clubIds },
+            },
+          },
+          {
+            $group: {
+              _id: "$paymentType",
+              revenue: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray();
+
+      // Membership revenue specifically
+      const membershipStats = revenueByType.find(
+        (r) => r._id === "membership"
+      ) || { revenue: 0, count: 0 };
+
+      // Event revenue specifically
+      const eventStats = revenueByType.find((r) => r._id === "event") || {
+        revenue: 0,
+        count: 0,
+      };
+
+      // Monthly revenue
+      const monthlyRevenue = await paymentsCollection
+        .aggregate([
+          {
+            $match: {
+              status: "completed",
+              relatedId: { $in: clubIds },
+            },
+          },
+          {
+            $addFields: {
+              createdAtDate: {
+                $cond: [
+                  { $eq: [{ $type: "$createdAt" }, "date"] },
+                  "$createdAt",
+                  { $toDate: "$createdAt" },
+                ],
+              },
+            },
+          },
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%b %Y",
+                  date: "$createdAtDate",
+                },
+              },
+              revenue: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { _id: 1 } },
+          {
+            $project: {
+              _id: 0,
+              month: "$_id",
+              revenue: { $round: ["$revenue", 2] },
+              count: 1,
+            },
+          },
+        ])
+        .toArray();
+
+      const stats = totalStats[0] || {
+        totalRevenue: 0,
+        totalTransactions: 0,
+        totalNetAmount: 0,
+        totalPlatformFees: 0,
+      };
+
+      res.json({
+        ...stats,
+        membershipRevenue: membershipStats.revenue || 0,
+        eventRevenue: eventStats.revenue || 0,
+        membershipCount: membershipStats.count || 0,
+        eventCount: eventStats.count || 0,
+        revenueByType,
+        monthlyRevenue,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: error.message });
+    }
+  }
+);
+
+/*===== Admin Routes =====*/
+// Admin Stats
+app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
   try {
-    const userEmail = req.token_email;
-
-    const totalClubs = await membershipsCollection.countDocuments({
-      userEmail,
-      status: "active",
-    });
-
-    const eventsAttended = await eventRegistrationsCollection.countDocuments({
-      userEmail,
-      status: "attended",
-    });
-
-    const activeMemberships = await membershipsCollection.countDocuments({
-      userEmail,
-      status: "active",
-    });
-
-    // Get membership breakdown by club
-    const clubsBreakdown = await membershipsCollection
+    const {
+      usersCollection,
+      clubsCollection,
+      membershipsCollection,
+      eventsCollection,
+      eventRegistrationsCollection,
+      paymentsCollection,
+    } = await connectDB();
+    const totalUsers = await usersCollection.countDocuments();
+    const totalClubs = await clubsCollection.countDocuments();
+    const totalEvents = await eventsCollection.countDocuments();
+    const totalRevenue = await paymentsCollection
       .aggregate([
-        { $match: { userEmail } },
-        {
-          $lookup: {
-            from: "clubsCollection",
-            localField: "clubId",
-            foreignField: "_id",
-            as: "club",
-          },
-        },
-        { $unwind: "$club" },
-        {
-          $group: {
-            _id: "$club.clubName",
-            value: { $sum: 1 },
-          },
-        },
-        { $project: { name: "$_id", value: 1, _id: 0 } },
+        { $match: { status: "completed" } },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
       ])
       .toArray();
 
-    // Event attendance history (last 6 months)
-    const sixMonthsAgo = new Date();
-    sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
-
-    const eventAttendanceHistory = await eventRegistrationsCollection
+    // Events revenue
+    const eventsRevenue = await paymentsCollection
       .aggregate([
-        { $match: { userEmail, createdAt: { $gte: sixMonthsAgo } } },
+        { $match: { status: "completed", paymentType: "event" } },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ])
+      .toArray();
+
+    // Membership revenue
+    const membershipRevenue = await paymentsCollection
+      .aggregate([
+        { $match: { status: "completed", paymentType: "membership" } },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ])
+      .toArray();
+
+    // Total event registrations
+    const totalEventRegistrations =
+      await eventRegistrationsCollection.countDocuments();
+
+    // User growth (last 6 months)
+    const userGrowth = await usersCollection
+      .aggregate([
+        {
+          $addFields: {
+            createdAtDate: {
+              $cond: [
+                { $eq: [{ $type: "$createdAt" }, "date"] },
+                "$createdAt",
+                { $toDate: "$createdAt" },
+              ],
+            },
+          },
+        },
         {
           $group: {
             _id: {
-              year: { $year: "$createdAt" },
-              month: { $month: "$createdAt" },
-            },
-            attendance: { $sum: 1 },
-          },
-        },
-        { $sort: { "_id.year": 1, "_id.month": 1 } },
-        {
-          $project: {
-            name: {
               $dateToString: {
-                format: "%b",
-                date: {
-                  $toDate: {
-                    $dateFromParts: {
-                      year: "$_id.year",
-                      month: "$_id.month",
-                      day: 1,
-                    },
-                  },
-                },
+                format: "%b %Y",
+                date: "$createdAtDate",
               },
             },
-            attendance: 1,
+            users: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+        {
+          $project: {
+            _id: 0,
+            name: "$_id",
+            users: 1,
+          },
+        },
+      ])
+      .toArray();
+    // Clubs by category
+    const clubsByCategory = await clubsCollection
+      .aggregate([
+        { $group: { _id: "$category", value: { $sum: 1 } } },
+        {
+          $project: {
+            _id: 0,
+            name: { $ifNull: ["$_id", "Uncategorized"] },
+            value: 1,
+          },
+        },
+      ])
+      .toArray();
+    // Monthly revenue
+    const revenueByMonth = await paymentsCollection
+      .aggregate([
+        { $match: { status: "completed" } },
+        {
+          $addFields: {
+            createdAtDate: {
+              $cond: [
+                { $eq: [{ $type: "$createdAt" }, "date"] },
+                "$createdAt",
+                { $toDate: "$createdAt" },
+              ],
+            },
+          },
+        },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%b %Y",
+                date: "$createdAtDate",
+              },
+            },
+            revenue: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+        {
+          $project: {
+            _id: 0,
+            month: "$_id",
+            revenue: { $round: ["$revenue", 2] },
+            count: 1,
+          },
+        },
+      ])
+      .toArray();
+    // Membership status distribution
+    const membershipDistribution = await membershipsCollection
+      .aggregate([
+        { $group: { _id: "$status", value: { $sum: 1 } } },
+        {
+          $project: {
+            _id: 0,
+            name: { $ifNull: ["$_id", "Unknown"] },
+            value: 1,
+          },
+        },
+      ])
+      .toArray();
+
+    // Events status distribution
+    const eventsStatusDistribution = await eventsCollection
+      .aggregate([
+        {
+          $group: {
+            _id: {
+              $cond: [
+                { $lt: ["$eventDate", new Date()] },
+                "Completed",
+                "Upcoming",
+              ],
+            },
+            value: { $sum: 1 },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            name: "$_id",
+            value: 1,
+          },
+        },
+      ])
+      .toArray();
+
+    // Top events by registration
+    const topEvents = await eventsCollection
+      .aggregate([
+        {
+          $lookup: {
+            from: "eventRegistrationsCollection",
+            localField: "_id",
+            foreignField: "eventId",
+            as: "registrations",
+          },
+        },
+        {
+          $project: {
+            title: 1,
+            registrations: { $size: "$registrations" },
+            eventDate: 1,
+          },
+        },
+        { $sort: { registrations: -1 } },
+        { $limit: 5 },
+        {
+          $project: {
+            name: "$title",
+            value: "$registrations",
             _id: 0,
           },
         },
       ])
       .toArray();
 
-    // Get membership status
-    const membershipStatus = await membershipsCollection.findOne(
-      { userEmail, status: "active" },
-      { projection: { status: 1 } }
-    );
+    // Monthly trends
+    const thisMonth = new Date();
+    thisMonth.setDate(1);
+    thisMonth.setHours(0, 0, 0, 0);
+    const lastMonth = new Date(thisMonth);
+    lastMonth.setMonth(lastMonth.getMonth() - 1);
+    const thisMonthUsers = await usersCollection.countDocuments({
+      createdAt: { $gte: thisMonth },
+    });
+    const lastMonthUsers = await usersCollection.countDocuments({
+      createdAt: { $gte: lastMonth, $lt: thisMonth },
+    });
+    const usersTrend =
+      lastMonthUsers > 0
+        ? Math.round(((thisMonthUsers - lastMonthUsers) / lastMonthUsers) * 100)
+        : 0;
+
+    // Calculate club trend
+    const thisMonthClubs = await clubsCollection.countDocuments({
+      createdAt: { $gte: thisMonth },
+    });
+    const lastMonthClubs = await clubsCollection.countDocuments({
+      createdAt: { $gte: lastMonth, $lt: thisMonth },
+    });
+    const clubsTrend =
+      lastMonthClubs > 0
+        ? Math.round(((thisMonthClubs - lastMonthClubs) / lastMonthClubs) * 100)
+        : 0;
+
+    // Calculate events trend
+    const thisMonthEvents = await eventsCollection.countDocuments({
+      createdAt: { $gte: thisMonth },
+    });
+    const lastMonthEvents = await eventsCollection.countDocuments({
+      createdAt: { $gte: lastMonth, $lt: thisMonth },
+    });
+    const eventsTrend =
+      lastMonthEvents > 0
+        ? Math.round(
+            ((thisMonthEvents - lastMonthEvents) / lastMonthEvents) * 100
+          )
+        : 0;
+
+    // Calculate revenue trend
+    const thisMonthRevenue = await paymentsCollection
+      .aggregate([
+        {
+          $match: {
+            status: "completed",
+            createdAt: { $gte: thisMonth },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ])
+      .toArray();
+    const lastMonthRevenue = await paymentsCollection
+      .aggregate([
+        {
+          $match: {
+            status: "completed",
+            createdAt: { $gte: lastMonth, $lt: thisMonth },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ])
+      .toArray();
+    const thisMonthRevenueTotal = thisMonthRevenue[0]?.total || 0;
+    const lastMonthRevenueTotal = lastMonthRevenue[0]?.total || 0;
+    const revenueTrend =
+      lastMonthRevenueTotal > 0
+        ? Math.round(
+            ((thisMonthRevenueTotal - lastMonthRevenueTotal) /
+              lastMonthRevenueTotal) *
+              100
+          )
+        : 0;
 
     res.json({
+      totalUsers,
       totalClubs,
-      eventsAttended,
-      activeMemberships,
-      friendsCount: 0,
-      membershipStatus: membershipStatus?.status || "inactive",
-      clubsBreakdown,
-      eventAttendanceHistory,
-      clubsTrend: 5,
-      eventsTrend: 3,
-      membershipsTrend: 2,
-      friendsTrend: 1,
+      totalEvents,
+      totalEventRegistrations,
+      totalRevenue: totalRevenue[0]?.total || 0,
+      eventsRevenue: eventsRevenue[0]?.total || 0,
+      membershipRevenue: membershipRevenue[0]?.total || 0,
+      userGrowth,
+      clubsByCategory,
+      revenueByMonth,
+      membershipDistribution,
+      eventsStatusDistribution,
+      topEvents,
+      usersTrend,
+      clubsTrend,
+      eventsTrend,
+      revenueTrend,
     });
   } catch (error) {
-    console.error("Error fetching member stats:", error);
+    console.error("Error fetching admin stats:", error);
     res.status(500).json({ message: "Error fetching stats" });
   }
 });
+// Get all payments (admin only)
+app.get(
+  "/admin/payments",
+  verifyFireBaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { paymentsCollection } = await connectDB();
+      const payments = await paymentsCollection
+        .find({})
+        .sort({ createdAt: -1 })
+        .toArray();
 
-// Get member's clubs
-app.get("/member/clubs", verifyFireBaseToken, async (req, res) => {
+      // Separate payments by type
+      const membershipPayments = payments.filter(
+        (p) => p.paymentType === "membership"
+      );
+      const eventPayments = payments.filter((p) => p.paymentType === "event");
+
+      res.json({
+        membershipPayments,
+        eventPayments,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: error.message });
+    }
+  }
+);
+// Get payment statistics (admin only)
+app.get(
+  "/admin/payments/statistics",
+  verifyFireBaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { paymentsCollection } = await connectDB();
+
+      // Overall statistics
+      const totalStats = await paymentsCollection
+        .aggregate([
+          { $match: { status: "completed" } },
+          {
+            $group: {
+              _id: null,
+              totalRevenue: { $sum: "$amount" },
+              totalTransactions: { $sum: 1 },
+              totalNetAmount: { $sum: "$netAmount" },
+              totalPlatformFees: { $sum: "$stripePlatformFee" },
+            },
+          },
+        ])
+        .toArray();
+
+      // Revenue by type
+      const revenueByType = await paymentsCollection
+        .aggregate([
+          { $match: { status: "completed" } },
+          {
+            $group: {
+              _id: "$paymentType",
+              revenue: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+        ])
+        .toArray();
+
+      // Membership revenue specifically
+      const membershipStats = revenueByType.find(
+        (r) => r._id === "membership"
+      ) || { revenue: 0, count: 0 };
+
+      // Event revenue specifically
+      const eventStats = revenueByType.find((r) => r._id === "event") || {
+        revenue: 0,
+        count: 0,
+      };
+
+      // Monthly revenue
+      const monthlyRevenue = await paymentsCollection
+        .aggregate([
+          { $match: { status: "completed" } },
+          {
+            $group: {
+              _id: {
+                year: { $year: "$createdAt" },
+                month: { $month: "$createdAt" },
+              },
+              revenue: { $sum: "$amount" },
+              count: { $sum: 1 },
+            },
+          },
+          { $sort: { "_id.year": 1, "_id.month": 1 } },
+          {
+            $project: {
+              month: {
+                $dateToString: {
+                  format: "%b",
+                  date: {
+                    $toDate: {
+                      $dateFromParts: {
+                        year: "$_id.year",
+                        month: "$_id.month",
+                        day: 1,
+                      },
+                    },
+                  },
+                },
+              },
+              revenue: 1,
+              count: 1,
+              _id: 0,
+            },
+          },
+        ])
+        .toArray();
+
+      const stats = totalStats[0] || {
+        totalRevenue: 0,
+        totalTransactions: 0,
+        totalNetAmount: 0,
+        totalPlatformFees: 0,
+      };
+
+      res.json({
+        ...stats,
+        membershipRevenue: membershipStats.revenue || 0,
+        eventRevenue: eventStats.revenue || 0,
+        membershipCount: membershipStats.count || 0,
+        eventCount: eventStats.count || 0,
+        revenueByType,
+        monthlyRevenue,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).json({ message: error.message });
+    }
+  }
+);
+// List all clubs (admin only)
+app.get("/admin/clubs", verifyFireBaseToken, verifyAdmin, async (req, res) => {
   try {
-    const userEmail = req.token_email;
-
-    const clubs = await membershipsCollection
-      .aggregate([
-        { $match: { userEmail } },
-        {
-          $lookup: {
-            from: "clubsCollection",
-            localField: "clubId",
-            foreignField: "_id",
-            as: "club",
-          },
-        },
-        { $unwind: "$club" },
-        {
-          $project: {
-            _id: "$club._id",
-            clubName: "$club.clubName",
-            description: "$club.description",
-            clubImage: "$club.clubImage",
-            category: "$club.category",
-            membershipStatus: "$status",
-            memberCount: "$club.memberCount",
-          },
-        },
-      ])
+    const { clubsCollection } = await connectDB();
+    const clubs = await clubsCollection
+      .find({})
+      .sort({ createdAt: -1 })
       .toArray();
-
-    res.json(clubs);
-  } catch (error) {
-    console.error("Error fetching member clubs:", error);
-    res.status(500).json({ message: "Error fetching clubs" });
+    res.send(clubs);
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: "Internal server error" });
   }
 });
-
-// Get member's events
-app.get("/member/events", verifyFireBaseToken, async (req, res) => {
+// Update club status (Admin only)
+app.patch(
+  "/clubs/status/:id",
+  verifyFireBaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { clubsCollection } = await connectDB();
+      const id = req.params.id;
+      const { status } = req.body;
+      if (!["pending", "approved", "rejected"].includes(status)) {
+        return res.status(400).send({ message: "Invalid status" });
+      }
+      await clubsCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { status, updatedAt: new Date() } }
+      );
+      res.send({ message: `Club ${status}` });
+    } catch (e) {
+      console.error(e);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// Update user role (Admin only)
+app.patch(
+  "/users/role/:id",
+  verifyFireBaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { usersCollection, applicationsCollection } = await connectDB();
+      const { type } = req.body;
+      const id = req.params.id;
+      const user = await usersCollection.findOne({ _id: new ObjectId(id) });
+      if (!user) return res.status(404).send({ message: "User not found" });
+      let newRole = user.role;
+      // ROLE UPDATE LOGIC
+      if (type === "promote") {
+        if (user.role === "member") newRole = "clubManager";
+        else if (user.role === "clubManager") newRole = "admin";
+      } else if (type === "demote") {
+        if (user.role === "clubManager") newRole = "member";
+      }
+      // Apply the role change
+      const updateResult = await usersCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { role: newRole } }
+      );
+      // APPLICATION SYNCING LOGIC
+      const application = await applicationsCollection.findOne({
+        email: user.email,
+      });
+      if (application) {
+        // Case 1: Promote → approve pending app
+        if (type === "promote" && ["clubManager", "admin"].includes(newRole)) {
+          if (application.status === "pending") {
+            await applicationsCollection.updateOne(
+              { email: user.email },
+              { $set: { status: "approved" } }
+            );
+          }
+        }
+        // Case 2: Demote → convert approved → pending
+        if (type === "demote" && newRole === "member") {
+          if (application.status === "approved") {
+            await applicationsCollection.updateOne(
+              { email: user.email },
+              { $set: { status: "pending" } }
+            );
+          }
+        }
+      }
+      res.send({
+        message: "Role updated & application synced",
+        newRole,
+      });
+    } catch (error) {
+      console.error(error);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// List all club manager applications
+app.get(
+  "/admin/club-manager-applications",
+  verifyFireBaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { applicationsCollection } = await connectDB();
+      const apps = await applicationsCollection.find({}).toArray();
+      res.send(apps);
+    } catch (e) {
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// Approve club manager application
+app.patch(
+  "/admin/club-manager-applications",
+  verifyFireBaseToken,
+  verifyAdmin,
+  async (req, res) => {
+    try {
+      const { email } = req.body;
+      const { usersCollection, applicationsCollection } = await connectDB();
+      if (!email) return res.status(400).send({ message: "Email is required" });
+      const application = await applicationsCollection.findOne({
+        email,
+        status: "pending",
+      });
+      if (!application) {
+        return res
+          .status(404)
+          .send({ message: "Application not found or already approved" });
+      }
+      await usersCollection.updateOne(
+        { email },
+        { $set: { role: "clubManager" } }
+      );
+      await applicationsCollection.updateOne(
+        { email },
+        { $set: { status: "approved" } }
+      );
+      res.send({ message: "Application approved" });
+    } catch (e) {
+      console.error(e);
+      res.status(500).send({ message: "Internal server error" });
+    }
+  }
+);
+// List all users (admin only)
+app.get("/admin/users", verifyFireBaseToken, verifyAdmin, async (req, res) => {
   try {
-    const userEmail = req.token_email;
-
-    const events = await eventRegistrationsCollection
-      .aggregate([
-        { $match: { userEmail } },
-        {
-          $lookup: {
-            from: "eventsCollection",
-            localField: "eventId",
-            foreignField: "_id",
-            as: "event",
-          },
-        },
-        { $unwind: "$event" },
-        {
-          $lookup: {
-            from: "clubsCollection",
-            localField: "event.clubId",
-            foreignField: "_id",
-            as: "club",
-          },
-        },
-        { $unwind: "$club" },
-        {
-          $project: {
-            _id: "$event._id",
-            title: "$event.title",
-            description: "$event.description",
-            eventImage: "$event.eventImage",
-            eventDate: "$event.eventDate",
-            clubName: "$club.clubName",
-            attended: { $eq: ["$status", "attended"] },
-          },
-        },
-        { $sort: { eventDate: -1 } },
-      ])
-      .toArray();
-
-    res.json(events);
-  } catch (error) {
-    console.error("Error fetching member events:", error);
-    res.status(500).json({ message: "Error fetching events" });
+    const { usersCollection } = await connectDB();
+    const users = await usersCollection.find().toArray();
+    res.send(users);
+  } catch (e) {
+    res.status(500).send({ message: "Internal server error" });
   }
 });
-
-app.listen(port, () => console.log(`Backend running on port ${port}`));
