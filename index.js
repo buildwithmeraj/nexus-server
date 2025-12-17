@@ -5,7 +5,6 @@ require("dotenv").config();
 const admin = require("firebase-admin");
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-
 // Define variables
 const app = express();
 const port = process.env.PORT || 3000;
@@ -15,7 +14,6 @@ const decoded = Buffer.from(process.env.FB_SERVICE_KEY, "base64").toString(
 const serviceAccount = JSON.parse(decoded);
 const uri = process.env.MONGODB_URI;
 const clientUrl = process.env.CLIENT_URL || "http://localhost:5173";
-
 // Middlewares
 app.use(express.json());
 app.use(
@@ -24,12 +22,10 @@ app.use(
     credentials: true,
   })
 );
-
 // Firebase admin setup
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
 });
-
 // MongoDB Setup
 const client = new MongoClient(uri, {
   serverApi: {
@@ -40,7 +36,6 @@ const client = new MongoClient(uri, {
   maxPoolSize: 10,
   connectTimeoutMS: 10000,
 });
-
 let usersDB, clubsDB, paymentsDB;
 let usersCollection,
   applicationsCollection,
@@ -124,7 +119,6 @@ async function createIndexes() {
 }
 // Call this after connecting
 connectDB().then(() => createIndexes());
-
 // Custom Middlewares
 const verifyFireBaseToken = async (req, res, next) => {
   const authorization = req.headers.authorization;
@@ -168,7 +162,6 @@ const verifyClubManager = async (req, res, next) => {
     res.status(500).send({ message: "Internal server error" });
   }
 };
-
 // Helper Functions
 async function recordPayment(paymentData) {
   const { paymentsCollection } = await connectDB();
@@ -256,10 +249,8 @@ app.get("/clubs", async (req, res) => {
   try {
     const { search, category, minFee, maxFee, status } = req.query;
     const { clubsCollection } = await connectDB();
-
     // Build filter object
     const filter = {};
-
     // Search by club name or description
     if (search && search.trim()) {
       filter.$or = [
@@ -268,30 +259,25 @@ app.get("/clubs", async (req, res) => {
         { location: { $regex: search, $options: "i" } },
       ];
     }
-
     // Filter by category
     if (category && category.trim()) {
       filter.category = category;
     }
-
     // Filter by membership fee range
     if (minFee || maxFee) {
       filter.membershipFee = {};
       if (minFee) filter.membershipFee.$gte = parseFloat(minFee);
       if (maxFee) filter.membershipFee.$lte = parseFloat(maxFee);
     }
-
     // Filter by status
     if (status) {
       filter.status = status;
     }
-
     // Execute query
     const clubs = await clubsCollection
       .find(filter)
       .sort({ createdAt: -1 })
       .toArray();
-
     res.json({
       success: true,
       data: clubs,
@@ -306,7 +292,6 @@ app.get("/clubs", async (req, res) => {
 app.get("/clubs/categories", async (req, res) => {
   try {
     const { clubsCollection } = await connectDB();
-
     const categories = await clubsCollection
       .aggregate([
         { $match: { status: "approved" } },
@@ -314,7 +299,6 @@ app.get("/clubs/categories", async (req, res) => {
         { $sort: { _id: 1 } },
       ])
       .toArray();
-
     res.json({
       success: true,
       data: categories.map((c) => c._id).filter(Boolean),
@@ -353,10 +337,8 @@ app.get("/events", async (req, res) => {
       limit = 0,
     } = req.query;
     const { eventsCollection } = await connectDB();
-
     // Build filter object
     const filter = {};
-
     // Search by event title or description
     if (search && search.trim()) {
       filter.$or = [
@@ -364,29 +346,24 @@ app.get("/events", async (req, res) => {
         { description: { $regex: search, $options: "i" } },
       ];
     }
-
     // Filter by club
     if (clubId && clubId.trim()) {
       filter.clubId = new ObjectId(clubId);
     }
-
     // Filter by location
     if (location && location.trim()) {
       filter.location = { $regex: location, $options: "i" };
     }
-
     // Filter by paid/free
     if (isPaid !== undefined && isPaid !== "") {
       filter.isPaid = isPaid === "true" || isPaid === true;
     }
-
     // Filter by date range
     if (minDate || maxDate) {
       filter.eventDate = {};
       if (minDate) filter.eventDate.$gte = new Date(minDate);
       if (maxDate) filter.eventDate.$lte = new Date(maxDate);
     }
-
     // Determine sort
     let sortObj = { createdAt: -1 }; // Default: newest first
     if (sort === "oldest") {
@@ -398,16 +375,12 @@ app.get("/events", async (req, res) => {
     } else if (sort === "upcoming") {
       sortObj = { eventDate: 1 };
     }
-
     // Execute query
     let query = eventsCollection.find(filter).sort(sortObj);
-
     if (parseInt(limit) > 0) {
       query = query.limit(parseInt(limit));
     }
-
     const events = await query.toArray();
-
     res.json({
       success: true,
       data: events,
@@ -513,7 +486,6 @@ app.get(
     try {
       const userEmail = req.token_email;
       const { paymentsCollection } = await connectDB();
-
       // Overall statistics
       const totalStats = await paymentsCollection
         .aggregate([
@@ -532,7 +504,6 @@ app.get(
           },
         ])
         .toArray();
-
       // Revenue by type
       const spendingByType = await paymentsCollection
         .aggregate([
@@ -551,18 +522,15 @@ app.get(
           },
         ])
         .toArray();
-
       // Membership spending specifically
       const membershipStats = spendingByType.find(
         (r) => r._id === "membership"
       ) || { amount: 0, count: 0 };
-
       // Event spending specifically
       const eventStats = spendingByType.find((r) => r._id === "event") || {
         amount: 0,
         count: 0,
       };
-
       // Monthly spending
       const monthlySpending = await paymentsCollection
         .aggregate([
@@ -606,12 +574,10 @@ app.get(
           },
         ])
         .toArray();
-
       const stats = totalStats[0] || {
         totalSpent: 0,
         totalTransactions: 0,
       };
-
       res.json({
         ...stats,
         membershipSpent: membershipStats.amount || 0,
@@ -731,7 +697,6 @@ app.post("/clubs/:clubId/join", verifyFireBaseToken, async (req, res) => {
         throw dbError;
       }
     }
-
     // Create Stripe Payment Intent for paid clubs
     const paymentIntent = await stripe.paymentIntents.create({
       amount: Math.round(club.membershipFee * 100),
@@ -763,11 +728,9 @@ app.post(
       const { paymentIntentId } = req.body;
       const userEmail = req.token_email;
       const { clubsCollection, membershipsCollection } = await connectDB();
-
       if (!paymentIntentId) {
         return res.status(400).send({ message: "Payment intent ID required" });
       }
-
       // Verify payment with Stripe
       const paymentIntent = await stripe.paymentIntents.retrieve(
         paymentIntentId
@@ -775,27 +738,23 @@ app.post(
       if (paymentIntent.status !== "succeeded") {
         return res.status(400).send({ message: "Payment not completed" });
       }
-
       // Check if membership already exists
       const existingMembership = await membershipsCollection.findOne({
         userEmail,
         clubId: new ObjectId(clubId),
         paymentId: paymentIntentId,
       });
-
       if (existingMembership) {
         return res
           .status(400)
           .send({ message: "Membership already created for this payment" });
       }
-
       const club = await clubsCollection.findOne({
         _id: new ObjectId(clubId),
       });
       if (!club) {
         return res.status(404).send({ message: "Club not found" });
       }
-
       // Create membership record
       const newMembership = {
         userEmail,
@@ -807,9 +766,7 @@ app.post(
         amount: paymentIntent.amount / 100,
         createdAt: new Date(),
       };
-
       const result = await membershipsCollection.insertOne(newMembership);
-
       // RECORD PAYMENT ✅ - ADD THIS
       await recordPayment({
         transactionId: paymentIntentId,
@@ -822,7 +779,6 @@ app.post(
         description: `Membership payment for ${club.clubName}`,
         stripeSessionId: paymentIntentId,
       });
-
       res.send({
         message: "Membership activated successfully",
         membershipId: result.insertedId,
@@ -1058,7 +1014,6 @@ app.post(
       const { clubId } = req.params;
       const userEmail = req.token_email;
       const { membershipsCollection, clubsCollection } = await connectDB();
-
       const club = await clubsCollection.findOne({
         _id: new ObjectId(clubId),
       });
@@ -1116,14 +1071,12 @@ app.post(
       const { paymentIntentId } = req.body;
       const userEmail = req.token_email;
       const { membershipsCollection, clubsCollection } = await connectDB();
-
       const paymentIntent = await stripe.paymentIntents.retrieve(
         paymentIntentId
       );
       if (paymentIntent.status !== "succeeded") {
         return res.status(400).send({ message: "Payment not completed" });
       }
-
       const membership = await membershipsCollection.findOne({
         userEmail,
         clubId: new ObjectId(clubId),
@@ -1378,23 +1331,19 @@ app.post(
       const { clubId } = req.params;
       const userEmail = req.token_email;
       const { clubsCollection, membershipsCollection } = await connectDB();
-
       if (!ObjectId.isValid(clubId)) {
         return res.status(400).send({ message: "Invalid club ID" });
       }
-
       const existingMembership = await membershipsCollection.findOne({
         userEmail,
         clubId: new ObjectId(clubId),
         status: "active",
       });
-
       if (existingMembership) {
         return res
           .status(400)
           .send({ message: "Already an active member of this club" });
       }
-
       const club = await clubsCollection.findOne({
         _id: new ObjectId(clubId),
       });
@@ -1409,7 +1358,6 @@ app.post(
           .status(400)
           .send({ message: "This club has free membership" });
       }
-
       const session = await stripe.checkout.sessions.create({
         payment_method_types: ["card"],
         line_items: [
@@ -1432,7 +1380,6 @@ app.post(
         cancel_url: `${clientUrl}/clubs/${clubId}`,
         metadata: { clubId, userEmail, type: "join" },
       });
-
       res.send({ url: session.url, sessionId: session.id });
     } catch (err) {
       console.error(err);
@@ -1449,11 +1396,9 @@ app.post(
       const { clubId } = req.params;
       const userEmail = req.token_email;
       const { membershipsCollection, clubsCollection } = await connectDB();
-
       if (!ObjectId.isValid(clubId)) {
         return res.status(400).send({ message: "Invalid club ID" });
       }
-
       const club = await clubsCollection.findOne({
         _id: new ObjectId(clubId),
       });
@@ -1463,16 +1408,13 @@ app.post(
           .status(400)
           .send({ message: "This club has free membership" });
       }
-
       const membership = await membershipsCollection.findOne({
         userEmail,
         clubId: new ObjectId(clubId),
       });
-
       if (!membership) {
         return res.status(404).send({ message: "Membership not found" });
       }
-
       const session = await stripe.checkout.sessions.create({
         payment_method_types: ["card"],
         line_items: [
@@ -1495,7 +1437,6 @@ app.post(
         cancel_url: `${clientUrl}/clubs/${clubId}`,
         metadata: { clubId, userEmail, type: "renewal" },
       });
-
       res.send({ url: session.url, sessionId: session.id });
     } catch (err) {
       console.error(err);
@@ -1509,11 +1450,9 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
     const { sessionId } = req.body;
     const userEmail = req.token_email;
     const { membershipsCollection, clubsCollection } = await connectDB();
-
     if (!sessionId) {
       return res.status(400).send({ message: "Session ID required" });
     }
-
     let session;
     try {
       session = await stripe.checkout.sessions.retrieve(sessionId);
@@ -1521,50 +1460,42 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
       console.error("Stripe retrieval error:", stripeErr);
       return res.status(400).send({ message: "Invalid session ID" });
     }
-
     if (session.payment_status !== "paid") {
       return res.status(400).send({
         message: `Payment not completed. Status: ${session.payment_status}`,
       });
     }
-
     const { clubId, type } = session.metadata;
     if (!clubId || !type) {
       return res.status(400).send({ message: "Invalid session metadata" });
     }
-
     if (type === "join") {
       const activeMembership = await membershipsCollection.findOne({
         userEmail,
         clubId: new ObjectId(clubId),
         status: "active",
       });
-
       if (activeMembership) {
         return res.send({
           message: "Already an active member of this club",
           alreadyMember: true,
         });
       }
-
       const existingPayment = await membershipsCollection.findOne({
         userEmail,
         clubId: new ObjectId(clubId),
         paymentId: sessionId,
       });
-
       if (existingPayment) {
         return res.send({
           message: "Membership already activated for this payment",
           alreadyProcessed: true,
         });
       }
-
       const club = await clubsCollection.findOne({
         _id: new ObjectId(clubId),
       });
       if (!club) return res.status(404).send({ message: "Club not found" });
-
       const newMembership = {
         userEmail,
         clubId: new ObjectId(clubId),
@@ -1575,10 +1506,8 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
         amount: session.amount_total / 100,
         createdAt: new Date(),
       };
-
       try {
         const result = await membershipsCollection.insertOne(newMembership);
-
         await recordPayment({
           transactionId: sessionId,
           userEmail,
@@ -1590,7 +1519,6 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
           description: `Membership payment for ${club.clubName}`,
           stripeSessionId: sessionId,
         });
-
         return res.send({
           message: "Membership activated successfully",
           membershipId: result.insertedId,
@@ -1603,14 +1531,12 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
             clubId: new ObjectId(clubId),
             paymentId: sessionId,
           });
-
           if (existingMembership) {
             return res.send({
               message: "Membership already exists for this payment",
               alreadyProcessed: true,
             });
           }
-
           return res.status(400).send({
             message: "Membership already exists for this club",
           });
@@ -1622,28 +1548,23 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
         userEmail,
         clubId: new ObjectId(clubId),
       });
-
       if (!membership) {
         return res.status(404).send({ message: "Membership not found" });
       }
-
       const alreadyRenewed = await membershipsCollection.findOne({
         userEmail,
         clubId: new ObjectId(clubId),
         paymentId: sessionId,
       });
-
       if (alreadyRenewed) {
         return res.send({
           message: "Membership already renewed with this payment",
           alreadyProcessed: true,
         });
       }
-
       const club = await clubsCollection.findOne({
         _id: new ObjectId(clubId),
       });
-
       const updateResult = await membershipsCollection.updateOne(
         { _id: membership._id },
         {
@@ -1655,11 +1576,9 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
           },
         }
       );
-
       if (updateResult.modifiedCount === 0) {
         return res.status(400).send({ message: "Failed to update membership" });
       }
-
       await recordPayment({
         transactionId: sessionId,
         userEmail,
@@ -1673,7 +1592,6 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
         }`,
         stripeSessionId: sessionId,
       });
-
       return res.send({
         message: "Membership renewed successfully",
         success: true,
@@ -1695,20 +1613,16 @@ app.get(
       const { eventId } = req.params;
       const userEmail = req.token_email;
       const { eventRegistrationsCollection } = await connectDB();
-
       if (!ObjectId.isValid(eventId)) {
         return res.status(400).send({ message: "Invalid event ID" });
       }
-
       const registration = await eventRegistrationsCollection.findOne({
         eventId: new ObjectId(eventId),
         userEmail,
       });
-
       if (!registration) {
         return res.send({ isRegistered: false, registration: null });
       }
-
       res.send({
         isRegistered: true,
         registration: {
@@ -1729,11 +1643,9 @@ app.get("/users/event-registrations", verifyFireBaseToken, async (req, res) => {
   try {
     const userEmail = req.token_email;
     const { eventRegistrationsCollection } = await connectDB();
-
     const registrations = await eventRegistrationsCollection
       .find({ userEmail })
       .toArray();
-
     res.send(registrations);
   } catch (err) {
     console.error(err);
@@ -1745,7 +1657,6 @@ app.get("/users/memberships", verifyFireBaseToken, async (req, res) => {
   try {
     const userEmail = req.token_email;
     const { membershipsCollection } = await connectDB();
-
     const memberships = await membershipsCollection
       .aggregate([
         { $match: { userEmail } },
@@ -1774,7 +1685,6 @@ app.get("/users/memberships", verifyFireBaseToken, async (req, res) => {
         },
       ])
       .toArray();
-
     res.send(memberships);
   } catch (err) {
     console.error(err);
@@ -1791,35 +1701,28 @@ app.delete(
       const userEmail = req.token_email;
       const { eventRegistrationsCollection, eventsCollection } =
         await connectDB();
-
       if (!ObjectId.isValid(registrationId)) {
         return res.status(400).send({ message: "Invalid registration ID" });
       }
-
       const registration = await eventRegistrationsCollection.findOne({
         _id: new ObjectId(registrationId),
       });
-
       if (!registration) {
         return res.status(404).send({ message: "Registration not found" });
       }
-
       // Verify ownership
       if (registration.userEmail !== userEmail) {
         return res.status(403).send({ message: "Not authorized" });
       }
-
       // Delete registration
       await eventRegistrationsCollection.deleteOne({
         _id: new ObjectId(registrationId),
       });
-
       // Decrement attendee count
       await eventsCollection.updateOne(
         { _id: registration.eventId },
         { $inc: { attendeeCount: -1 } }
       );
-
       res.send({ message: "Registration cancelled successfully" });
     } catch (err) {
       console.error(err);
@@ -1832,7 +1735,6 @@ app.get("/member/payments", verifyFireBaseToken, async (req, res) => {
   try {
     const userEmail = req.token_email;
     const { paymentsCollection } = await connectDB();
-
     // Get all payments for this user
     const payments = await paymentsCollection
       .find({
@@ -1841,13 +1743,11 @@ app.get("/member/payments", verifyFireBaseToken, async (req, res) => {
       })
       .sort({ createdAt: -1 })
       .toArray();
-
     // Separate payments by type
     const membershipPayments = payments.filter(
       (p) => p.paymentType === "membership"
     );
     const eventPayments = payments.filter((p) => p.paymentType === "event");
-
     res.json({
       membershipPayments,
       eventPayments,
@@ -2354,21 +2254,17 @@ app.get(
     try {
       const managerEmail = req.token_email;
       const { clubsCollection, paymentsCollection } = await connectDB();
-
       // Get all clubs managed by this manager
       const managedClubs = await clubsCollection
         .find({ managerEmail })
         .toArray();
-
       if (managedClubs.length === 0) {
         return res.json({
           membershipPayments: [],
           eventPayments: [],
         });
       }
-
       const clubIds = managedClubs.map((club) => club._id.toString());
-
       // Get all payments related to these clubs
       const payments = await paymentsCollection
         .find({
@@ -2377,13 +2273,11 @@ app.get(
         })
         .sort({ createdAt: -1 })
         .toArray();
-
       // Separate payments by type
       const membershipPayments = payments.filter(
         (p) => p.paymentType === "membership"
       );
       const eventPayments = payments.filter((p) => p.paymentType === "event");
-
       res.json({
         membershipPayments,
         eventPayments,
@@ -2403,12 +2297,10 @@ app.get(
     try {
       const managerEmail = req.token_email;
       const { clubsCollection, paymentsCollection } = await connectDB();
-
       // Get all clubs managed by this manager
       const managedClubs = await clubsCollection
         .find({ managerEmail })
         .toArray();
-
       if (managedClubs.length === 0) {
         return res.json({
           totalRevenue: 0,
@@ -2419,9 +2311,7 @@ app.get(
           monthlyRevenue: [],
         });
       }
-
       const clubIds = managedClubs.map((club) => club._id.toString());
-
       // Overall statistics
       const totalStats = await paymentsCollection
         .aggregate([
@@ -2442,7 +2332,6 @@ app.get(
           },
         ])
         .toArray();
-
       // Revenue by type
       const revenueByType = await paymentsCollection
         .aggregate([
@@ -2461,18 +2350,15 @@ app.get(
           },
         ])
         .toArray();
-
       // Membership revenue specifically
       const membershipStats = revenueByType.find(
         (r) => r._id === "membership"
       ) || { revenue: 0, count: 0 };
-
       // Event revenue specifically
       const eventStats = revenueByType.find((r) => r._id === "event") || {
         revenue: 0,
         count: 0,
       };
-
       // Monthly revenue
       const monthlyRevenue = await paymentsCollection
         .aggregate([
@@ -2516,14 +2402,12 @@ app.get(
           },
         ])
         .toArray();
-
       const stats = totalStats[0] || {
         totalRevenue: 0,
         totalTransactions: 0,
         totalNetAmount: 0,
         totalPlatformFees: 0,
       };
-
       res.json({
         ...stats,
         membershipRevenue: membershipStats.revenue || 0,
@@ -2561,7 +2445,6 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
         { $group: { _id: null, total: { $sum: "$amount" } } },
       ])
       .toArray();
-
     // Events revenue
     const eventsRevenue = await paymentsCollection
       .aggregate([
@@ -2569,7 +2452,6 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
         { $group: { _id: null, total: { $sum: "$amount" } } },
       ])
       .toArray();
-
     // Membership revenue
     const membershipRevenue = await paymentsCollection
       .aggregate([
@@ -2577,11 +2459,9 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
         { $group: { _id: null, total: { $sum: "$amount" } } },
       ])
       .toArray();
-
     // Total event registrations
     const totalEventRegistrations =
       await eventRegistrationsCollection.countDocuments();
-
     // User growth (last 6 months)
     const userGrowth = await usersCollection
       .aggregate([
@@ -2681,7 +2561,6 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
         },
       ])
       .toArray();
-
     // Events status distribution
     const eventsStatusDistribution = await eventsCollection
       .aggregate([
@@ -2706,7 +2585,6 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
         },
       ])
       .toArray();
-
     // Top events by registration
     const topEvents = await eventsCollection
       .aggregate([
@@ -2736,7 +2614,6 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
         },
       ])
       .toArray();
-
     // Monthly trends
     const thisMonth = new Date();
     thisMonth.setDate(1);
@@ -2753,7 +2630,6 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
       lastMonthUsers > 0
         ? Math.round(((thisMonthUsers - lastMonthUsers) / lastMonthUsers) * 100)
         : 0;
-
     // Calculate club trend
     const thisMonthClubs = await clubsCollection.countDocuments({
       createdAt: { $gte: thisMonth },
@@ -2765,7 +2641,6 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
       lastMonthClubs > 0
         ? Math.round(((thisMonthClubs - lastMonthClubs) / lastMonthClubs) * 100)
         : 0;
-
     // Calculate events trend
     const thisMonthEvents = await eventsCollection.countDocuments({
       createdAt: { $gte: thisMonth },
@@ -2779,7 +2654,6 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
             ((thisMonthEvents - lastMonthEvents) / lastMonthEvents) * 100
           )
         : 0;
-
     // Calculate revenue trend
     const thisMonthRevenue = await paymentsCollection
       .aggregate([
@@ -2813,7 +2687,6 @@ app.get("/admin/stats", verifyFireBaseToken, verifyAdmin, async (req, res) => {
               100
           )
         : 0;
-
     res.json({
       totalUsers,
       totalClubs,
@@ -2850,13 +2723,11 @@ app.get(
         .find({})
         .sort({ createdAt: -1 })
         .toArray();
-
       // Separate payments by type
       const membershipPayments = payments.filter(
         (p) => p.paymentType === "membership"
       );
       const eventPayments = payments.filter((p) => p.paymentType === "event");
-
       res.json({
         membershipPayments,
         eventPayments,
@@ -2875,7 +2746,6 @@ app.get(
   async (req, res) => {
     try {
       const { paymentsCollection } = await connectDB();
-
       // Overall statistics
       const totalStats = await paymentsCollection
         .aggregate([
@@ -2891,7 +2761,6 @@ app.get(
           },
         ])
         .toArray();
-
       // Revenue by type
       const revenueByType = await paymentsCollection
         .aggregate([
@@ -2905,18 +2774,15 @@ app.get(
           },
         ])
         .toArray();
-
       // Membership revenue specifically
       const membershipStats = revenueByType.find(
         (r) => r._id === "membership"
       ) || { revenue: 0, count: 0 };
-
       // Event revenue specifically
       const eventStats = revenueByType.find((r) => r._id === "event") || {
         revenue: 0,
         count: 0,
       };
-
       // Monthly revenue
       const monthlyRevenue = await paymentsCollection
         .aggregate([
@@ -2955,14 +2821,12 @@ app.get(
           },
         ])
         .toArray();
-
       const stats = totalStats[0] || {
         totalRevenue: 0,
         totalTransactions: 0,
         totalNetAmount: 0,
         totalPlatformFees: 0,
       };
-
       res.json({
         ...stats,
         membershipRevenue: membershipStats.revenue || 0,
