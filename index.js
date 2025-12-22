@@ -247,7 +247,7 @@ app.post("/users", async (req, res) => {
 // List all clubs with filters
 app.get("/clubs", async (req, res) => {
   try {
-    const { search, category, minFee, maxFee, status } = req.query;
+    const { search, category, minFee, maxFee, status, limit } = req.query;
     const { clubsCollection } = await connectDB();
     // Build filter object
     const filter = {};
@@ -258,6 +258,11 @@ app.get("/clubs", async (req, res) => {
         { description: { $regex: search, $options: "i" } },
         { location: { $regex: search, $options: "i" } },
       ];
+    }
+    // set limit
+    let clubsLimit = 0;
+    if (limit && parseInt(limit) > 0) {
+      clubsLimit = parseInt(limit);
     }
     // Filter by category
     if (category && category.trim()) {
@@ -277,6 +282,7 @@ app.get("/clubs", async (req, res) => {
     const clubs = await clubsCollection
       .find(filter)
       .sort({ createdAt: -1 })
+      .limit(clubsLimit)
       .toArray();
     res.json({
       success: true,
@@ -430,39 +436,43 @@ app.get("/events/:eventId", async (req, res) => {
 
 /*===== Protected routes (for members) =====*/
 // Apply for Club Manager role
-app.post("/users/apply-club-manager", verifyFireBaseToken, async (req, res) => {
-  try {
-    const { usersCollection, applicationsCollection } = await connectDB();
-    const email = req.token_email;
-    const user = await usersCollection.findOne({ email });
-    if (!user) return res.status(404).send({ message: "User not found" });
-    if (user.role !== "member") {
-      return res
-        .status(400)
-        .send({ message: "Only Members can apply for Club Manager" });
+app.post(
+  "/member/apply-club-manager",
+  verifyFireBaseToken,
+  async (req, res) => {
+    try {
+      const { usersCollection, applicationsCollection } = await connectDB();
+      const email = req.token_email;
+      const user = await usersCollection.findOne({ email });
+      if (!user) return res.status(404).send({ message: "User not found" });
+      if (user.role !== "member") {
+        return res
+          .status(400)
+          .send({ message: "Only Members can apply for Club Manager" });
+      }
+      const existing = await applicationsCollection.findOne({ email });
+      if (existing) {
+        return res
+          .status(400)
+          .send({ message: "Already applied for Club Manager" });
+      }
+      const result = await applicationsCollection.insertOne({
+        name: user.name,
+        email,
+        status: "pending",
+        createdAt: new Date(),
+      });
+      res
+        .status(201)
+        .send({ message: "Application submitted", id: result.insertedId });
+    } catch (e) {
+      res.status(500).send({ message: "Internal server error" });
     }
-    const existing = await applicationsCollection.findOne({ email });
-    if (existing) {
-      return res
-        .status(400)
-        .send({ message: "Already applied for Club Manager" });
-    }
-    const result = await applicationsCollection.insertOne({
-      name: user.name,
-      email,
-      status: "pending",
-      createdAt: new Date(),
-    });
-    res
-      .status(201)
-      .send({ message: "Application submitted", id: result.insertedId });
-  } catch (e) {
-    res.status(500).send({ message: "Internal server error" });
   }
-});
+);
 // Check Club Manager application status
 app.get(
-  "/users/apply-club-manager/status",
+  "/member/apply-club-manager/status",
   verifyFireBaseToken,
   async (req, res) => {
     try {
@@ -593,6 +603,302 @@ app.get(
     }
   }
 );
+// Get Member's Event Categories Breakdown
+app.get("/member/event-categories", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const { eventRegistrationsCollection, eventsCollection, clubsCollection } =
+      await connectDB();
+
+    const eventCategories = await eventRegistrationsCollection
+      .aggregate([
+        { $match: { userEmail } },
+        {
+          $lookup: {
+            from: "eventsCollection",
+            localField: "eventId",
+            foreignField: "_id",
+            as: "event",
+          },
+        },
+        { $unwind: "$event" },
+        {
+          $lookup: {
+            from: "clubsCollection",
+            localField: "event.clubId",
+            foreignField: "_id",
+            as: "club",
+          },
+        },
+        { $unwind: "$club" },
+        {
+          $group: {
+            _id: "$club.category",
+            value: { $sum: 1 },
+          },
+        },
+        {
+          $project: {
+            name: "$_id",
+            value: 1,
+            _id: 0,
+          },
+        },
+        { $sort: { value: -1 } },
+      ])
+      .toArray();
+
+    res.json(eventCategories);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: error.message });
+  }
+});
+// Get Member's Activity Summary
+app.get("/member/activity-summary", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const {
+      membershipsCollection,
+      eventRegistrationsCollection,
+      paymentsCollection,
+      clubsCollection,
+    } = await connectDB();
+
+    // Total spent this month
+    const thisMonth = new Date();
+    thisMonth.setDate(1);
+
+    const thisMonthSpent = await paymentsCollection
+      .aggregate([
+        {
+          $match: {
+            userEmail,
+            status: "completed",
+            createdAt: { $gte: thisMonth },
+          },
+        },
+        { $group: { _id: null, total: { $sum: "$amount" } } },
+      ])
+      .toArray();
+
+    // Most visited club
+    const mostVisitedClub = await membershipsCollection
+      .aggregate([
+        { $match: { userEmail, status: "active" } },
+        {
+          $lookup: {
+            from: "clubsCollection",
+            localField: "clubId",
+            foreignField: "_id",
+            as: "club",
+          },
+        },
+        { $unwind: "$club" },
+        { $sort: { joinedAt: -1 } },
+        { $limit: 1 },
+        {
+          $project: {
+            clubName: "$club.clubName",
+            joinedAt: 1,
+            expiresAt: 1,
+          },
+        },
+      ])
+      .toArray();
+
+    // Upcoming events
+    const upcomingEvents = await eventRegistrationsCollection
+      .aggregate([
+        { $match: { userEmail } },
+        {
+          $lookup: {
+            from: "eventsCollection",
+            localField: "eventId",
+            foreignField: "_id",
+            as: "event",
+          },
+        },
+        { $unwind: "$event" },
+        {
+          $match: {
+            "event.eventDate": { $gte: new Date() },
+          },
+        },
+        { $sort: { "event.eventDate": 1 } },
+        { $limit: 5 },
+        {
+          $project: {
+            title: "$event.title",
+            eventDate: "$event.eventDate",
+            location: "$event.location",
+          },
+        },
+      ])
+      .toArray();
+
+    res.json({
+      thisMonthSpent: thisMonthSpent[0]?.total || 0,
+      mostVisitedClub: mostVisitedClub[0] || null,
+      upcomingEvents,
+    });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Get Member's Spending by Type (Membership vs Event)
+app.get("/member/spending-by-type", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const { paymentsCollection } = await connectDB();
+
+    const spendingByType = await paymentsCollection
+      .aggregate([
+        {
+          $match: {
+            userEmail,
+            status: "completed",
+          },
+        },
+        {
+          $group: {
+            _id: "$paymentType",
+            value: { $sum: "$amount" },
+            count: { $sum: 1 },
+          },
+        },
+        {
+          $project: {
+            name: {
+              $cond: [
+                { $eq: ["$_id", "membership"] },
+                "Club Memberships",
+                "Event Registrations",
+              ],
+            },
+            value: { $round: ["$value", 2] },
+            count: 1,
+            _id: 0,
+          },
+        },
+      ])
+      .toArray();
+
+    res.json(spendingByType);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Get Member's Payment Timeline (Last 12 months)
+app.get("/member/payment-timeline", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const { paymentsCollection } = await connectDB();
+
+    const oneYearAgo = new Date();
+    oneYearAgo.setFullYear(oneYearAgo.getFullYear() - 1);
+
+    const paymentTimeline = await paymentsCollection
+      .aggregate([
+        {
+          $match: {
+            userEmail,
+            status: "completed",
+            createdAt: { $gte: oneYearAgo },
+          },
+        },
+        {
+          $addFields: {
+            createdAtDate: {
+              $cond: [
+                { $eq: [{ $type: "$createdAt" }, "date"] },
+                "$createdAt",
+                { $toDate: "$createdAt" },
+              ],
+            },
+          },
+        },
+        {
+          $group: {
+            _id: {
+              $dateToString: {
+                format: "%b %Y",
+                date: "$createdAtDate",
+              },
+            },
+            totalAmount: { $sum: "$amount" },
+            transactionCount: { $sum: 1 },
+          },
+        },
+        { $sort: { _id: 1 } },
+        {
+          $project: {
+            name: "$_id",
+            amount: { $round: ["$totalAmount", 2] },
+            transactions: "$transactionCount",
+            _id: 0,
+          },
+        },
+      ])
+      .toArray();
+
+    res.json(paymentTimeline);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
+// Get Member's Club Spending Breakdown
+app.get("/member/club-spending", verifyFireBaseToken, async (req, res) => {
+  try {
+    const userEmail = req.token_email;
+    const { membershipsCollection, clubsCollection, paymentsCollection } =
+      await connectDB();
+
+    // Get member's clubs with spending
+    const clubSpending = await membershipsCollection
+      .aggregate([
+        { $match: { userEmail, status: "active" } },
+        {
+          $lookup: {
+            from: "clubsCollection",
+            localField: "clubId",
+            foreignField: "_id",
+            as: "club",
+          },
+        },
+        { $unwind: "$club" },
+        {
+          $group: {
+            _id: "$club.clubName",
+            spent: { $sum: "$amount" },
+            clubId: { $first: "$clubId" },
+          },
+        },
+        {
+          $project: {
+            name: "$_id",
+            value: "$spent",
+            clubId: 1,
+            _id: 0,
+          },
+        },
+        { $sort: { value: -1 } },
+      ])
+      .toArray();
+
+    res.json(clubSpending);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ message: error.message });
+  }
+});
+
 // Check membership status for a club
 app.get(
   "/clubs/:clubId/membership-status",
@@ -672,7 +978,6 @@ app.post("/clubs/:clubId/join", verifyFireBaseToken, async (req, res) => {
       };
       try {
         const result = await membershipsCollection.insertOne(newMembership);
-        // RECORD PAYMENT ✅ - ADD THIS (free membership payment record)
         await recordPayment({
           transactionId: `free-${clubId}-${userEmail}-${Date.now()}`,
           userEmail,
@@ -767,7 +1072,6 @@ app.post(
         createdAt: new Date(),
       };
       const result = await membershipsCollection.insertOne(newMembership);
-      // RECORD PAYMENT ✅ - ADD THIS
       await recordPayment({
         transactionId: paymentIntentId,
         userEmail,
@@ -1095,7 +1399,6 @@ app.post(
           },
         }
       );
-      // RECORD PAYMENT ✅ - ADD THIS
       await recordPayment({
         transactionId: paymentIntentId,
         userEmail,
@@ -1606,7 +1909,7 @@ app.post("/clubs/verify-session", verifyFireBaseToken, async (req, res) => {
 });
 // Get user event registration for a specific event
 app.get(
-  "/users/event-registrations/:eventId",
+  "/member/event-registrations/:eventId",
   verifyFireBaseToken,
   async (req, res) => {
     try {
@@ -1638,22 +1941,46 @@ app.get(
     }
   }
 );
-// Get all user event registrations
-app.get("/users/event-registrations", verifyFireBaseToken, async (req, res) => {
-  try {
-    const userEmail = req.token_email;
-    const { eventRegistrationsCollection } = await connectDB();
-    const registrations = await eventRegistrationsCollection
-      .find({ userEmail })
-      .toArray();
-    res.send(registrations);
-  } catch (err) {
-    console.error(err);
-    res.status(500).send({ message: "Internal server error" });
+// Get all user event registrations with event details
+app.get(
+  "/member/event-registrations",
+  verifyFireBaseToken,
+  async (req, res) => {
+    try {
+      const userEmail = req.token_email;
+      const { eventRegistrationsCollection, eventsCollection } =
+        await connectDB();
+
+      const registrations = await eventRegistrationsCollection
+        .find({ userEmail: userEmail })
+        .toArray();
+
+      // Fetch event details for each registration
+      const registrationsWithDetails = await Promise.all(
+        registrations.map(async (reg) => {
+          const event = await eventsCollection.findOne({
+            _id: reg.eventId,
+          });
+
+          return {
+            ...reg,
+            eventTitle: event?.title || "Unknown Event",
+            eventDate: event?.date || event?.eventDate,
+            eventLocation: event?.location || "TBA",
+            isPaid: event?.isPaid || false,
+          };
+        })
+      );
+
+      res.send(registrationsWithDetails);
+    } catch (err) {
+      console.error(err);
+      res.status(500).send({ message: "Internal server error" });
+    }
   }
-});
+);
 // Get all user memberships
-app.get("/users/memberships", verifyFireBaseToken, async (req, res) => {
+app.get("/member/memberships", verifyFireBaseToken, async (req, res) => {
   try {
     const userEmail = req.token_email;
     const { membershipsCollection } = await connectDB();
@@ -1757,25 +2084,6 @@ app.get("/member/payments", verifyFireBaseToken, async (req, res) => {
     res.status(500).json({ message: error.message });
   }
 });
-// Get payments for a user
-// app.get("/payments/user/:email", verifyFireBaseToken, async (req, res) => {
-//   try {
-//     const { paymentsCollection, usersCollection } = await connectDB();
-//     const email = req.params.email;
-//     const user = await usersCollection.findOne({ email: req.token_email });
-//     if (req.token_email !== email && user?.role !== "admin") {
-//       return res.status(403).json({ message: "Unauthorized" });
-//     }
-//     const payments = await paymentsCollection
-//       .find({ userEmail: email })
-//       .sort({ createdAt: -1 })
-//       .toArray();
-//     res.json(payments);
-//   } catch (error) {
-//     console.error(error);
-//     res.status(500).json({ message: error.message });
-//   }
-// });
 
 /*===== Club Manager Routes =====*/
 // Get club(s) by ID or manager email
@@ -2034,35 +2342,7 @@ app.delete(
     }
   }
 );
-// // Manager's Events
-// app.get(
-//   "/manager/events",
-//   verifyFireBaseToken,
-//   verifyClubManager,
-//   async (req, res) => {
-//     try {
-//       const { eventsCollection, clubsCollection } = await connectDB();
-//       const managerEmail = req.token_email;
-//       const managedClubs = await clubsCollection
-//         .find({ managerEmail })
-//         .toArray();
-//       if (managedClubs.length === 0) return res.send([]);
-//       const clubIds = managedClubs.map((club) => club._id);
-//       const events = await eventsCollection
-//         .find({ clubId: { $in: clubIds } })
-//         .sort({ eventDate: -1 })
-//         .toArray();
-//       const enrichedEvents = events.map((event) => {
-//         const club = managedClubs.find((c) => c._id.equals(event.clubId));
-//         return { ...event, clubData: club };
-//       });
-//       res.send(enrichedEvents);
-//     } catch (err) {
-//       console.error(err);
-//       res.status(500).send({ message: "Internal server error" });
-//     }
-//   }
-// );
+
 // Club Manager Stats
 app.get(
   "/club-manager/statistics",
